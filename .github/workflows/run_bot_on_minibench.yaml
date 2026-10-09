@@ -1,0 +1,57 @@
+name: Forecast on MiniBench
+
+# MiniBench only -- the seasonal tournament (fall-futureeval-2026) stays off
+# via the ENABLE_SEASONAL_TOURNAMENT config flag (defaults False in
+# metaculus_bot/config.py) until paid LLM credits + stronger models are
+# confirmed. See docs/STAGE_B_PLAN.md for the free-tier rate-limit math
+# behind the cron interval and MAX_QUESTIONS_PER_DAY throttle.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 */2 * * *" # every 2 hours, offset off the hour
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# Needed to push the updated forecast DB to the `data` branch.
+permissions:
+  contents: write
+
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Restore forecast DB from data branch
+        run: bash scripts/restore_data_branch.sh
+      - name: Run bot (MiniBench only)
+        run: poetry run python main.py --mode tournament --target minibench --publish
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          # Optional operational overrides -- set as repo Variables (not
+          # Secrets) if you want to change these without a code change.
+          # Empty/unset falls back to the code default in config.py.
+          MAX_COST_PER_DAY: ${{ vars.MAX_COST_PER_DAY }}
+          MAX_QUESTIONS_PER_DAY: ${{ vars.MAX_QUESTIONS_PER_DAY }}
+          ENABLE_SEASONAL_TOURNAMENT: ${{ vars.ENABLE_SEASONAL_TOURNAMENT }}
+      - name: Persist forecast DB to data branch
+        if: always()
+        run: bash scripts/persist_data_branch.sh

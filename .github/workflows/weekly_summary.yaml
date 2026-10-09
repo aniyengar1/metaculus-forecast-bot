@@ -1,0 +1,37 @@
+name: Weekly Summary
+
+# Prints a summary of the last 7 days' bot activity (questions forecast, $
+# spent, AskNews usage, alerts, and resolved-question scores once those
+# exist) to this workflow's job log, read from the persisted forecast DB.
+# No API calls, no spend -- purely reads data/forecasts.db from the `data`
+# branch.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1" # Monday 09:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  summary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Restore forecast DB from data branch
+        run: bash scripts/restore_data_branch.sh
+      - name: Print weekly summary
+        run: poetry run python scripts/weekly_summary.py --days 7

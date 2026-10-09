@@ -1,0 +1,43 @@
+name: Test Bot
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# Needed to push the updated forecast DB to the `data` branch.
+permissions:
+  contents: write
+
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Restore forecast DB from data branch
+        run: bash scripts/restore_data_branch.sh
+      - name: Run bot (bot-testing-area sandbox)
+        run: poetry run python main.py --mode test_questions --publish
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+      - name: Persist forecast DB to data branch
+        if: always()
+        run: bash scripts/persist_data_branch.sh
