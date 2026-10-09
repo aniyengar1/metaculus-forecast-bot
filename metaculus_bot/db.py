@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS asknews_usage (
     calls_used INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS seen_questions (
+    question_id INTEGER PRIMARY KEY,
+    post_id INTEGER,
+    question_title TEXT,
+    question_url TEXT,
+    close_time TEXT,
+    first_seen_at TEXT NOT NULL,
+    forecasted INTEGER NOT NULL DEFAULT 0,
+    closed_unforecast_alerted INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
@@ -169,3 +180,66 @@ def increment_asknews_usage(conn: sqlite3.Connection, month: str, n: int = 1) ->
     )
     conn.commit()
     return get_asknews_usage(conn, month)
+
+
+def upsert_seen_question(
+    conn: sqlite3.Connection,
+    *,
+    question_id: int,
+    post_id: int | None,
+    question_title: str,
+    question_url: str,
+    close_time_iso: str | None,
+) -> None:
+    """Records that we've observed this open question, if not already
+    tracked. Does not overwrite forecasted/alerted flags on an existing row."""
+    conn.execute(
+        """
+        INSERT INTO seen_questions
+            (question_id, post_id, question_title, question_url, close_time, first_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(question_id) DO NOTHING
+        """,
+        (
+            question_id,
+            post_id,
+            question_title,
+            question_url,
+            close_time_iso,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def mark_question_forecasted(conn: sqlite3.Connection, question_id: int) -> None:
+    conn.execute(
+        "UPDATE seen_questions SET forecasted = 1 WHERE question_id = ?", (question_id,)
+    )
+    conn.commit()
+
+
+def find_newly_closed_unforecast(conn: sqlite3.Connection) -> list[tuple[int, str, str, str]]:
+    """Questions we saw while open, never forecast, whose close_time has now
+    passed, and haven't already been alerted on. Returns
+    (question_id, title, url, close_time)."""
+    now = datetime.now(timezone.utc).isoformat()
+    return conn.execute(
+        """
+        SELECT question_id, question_title, question_url, close_time
+        FROM seen_questions
+        WHERE forecasted = 0
+          AND closed_unforecast_alerted = 0
+          AND close_time IS NOT NULL
+          AND close_time < ?
+        """,
+        (now,),
+    ).fetchall()
+
+
+def mark_closed_unforecast_alerted(conn: sqlite3.Connection, question_id: int) -> None:
+    conn.execute(
+        "UPDATE seen_questions SET closed_unforecast_alerted = 1 WHERE question_id = ?",
+        (question_id,),
+    )
+    conn.commit()

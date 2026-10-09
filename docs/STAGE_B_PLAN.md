@@ -103,3 +103,31 @@ Both the MiniBench and Test Bot workflows restore before running and persist
 the same `data` branch -- intentional, since both draw on the same real
 OpenRouter account and should see each other's spend/question counts when
 computing the daily throttles.
+
+## Follow-ups 2026-10-09
+
+**Soonest-close-time prioritization.** When a `--limit` or the daily throttle
+means not every open question gets forecast this run, we now sort by
+`close_time` ascending first (`main.py`), so a tight cap drops the questions
+with the most runway left, not an arbitrary subset. Every open question we
+see gets upserted into a new `seen_questions` table (question id, close_time,
+a `forecasted` flag) regardless of whether we get to it this run; each run
+also checks that table for anything that closed while still unforecast and
+logs it to `alerts` (`db.find_newly_closed_unforecast`) -- a question being
+silently missed is now something we'd actually notice.
+
+**OpenRouter quota pre-flight guard.** `GET /api/v1/key` (metadata, doesn't
+spend a request) reports `free_model_daily_requests: {used, limit,
+remaining}` for the account. `main.py` checks this before any local or
+manually-dispatched run and refuses to start (`ENFORCE_RATE_LIMIT_GUARD=true`,
+the default) if remaining quota is below what the next scheduled production
+run needs (`MIN_QUOTA_RESERVE_FOR_SCHEDULED_RUN=15` = ~1 health-check pass +
+~1 question). The actual cron-triggered run is exempt
+(`GITHUB_EVENT_NAME == "schedule"`, set automatically by GitHub Actions only
+for schedule triggers, never `workflow_dispatch` or local) -- the guard exists
+to protect that run, so it can never be the thing blocking itself.
+
+Built after confirming the problem was real, not hypothetical: a `GET
+/api/v1/key` check mid-writing-this showed `used: 53, limit: 50, remaining: 0`
+-- our own Stage A/B testing earlier had already exhausted the account's
+real daily cap.

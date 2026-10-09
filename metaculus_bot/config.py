@@ -118,6 +118,13 @@ class Config:
     # to ~70) once $10 of OpenRouter credit has been purchased.
     max_questions_per_day: int = 8
 
+    # Pre-flight OpenRouter quota guard for local/manual runs only (the
+    # actual scheduled cron run is exempt -- see main.py's IS_SCHEDULED_RUN).
+    # Reserve = 1 health-check pass (~10) + 1 question (~5) so the *next*
+    # scheduled run still has a realistic chance to do something.
+    min_quota_reserve_for_scheduled_run: int = 15
+    enforce_rate_limit_guard: bool = True
+
     # Seasonal tournament (fall-futureeval-2026) stays off until paid LLM
     # credits + stronger models are confirmed -- weak free-tier forecasts
     # there would hurt the seasonal score. MiniBench runs regardless.
@@ -153,6 +160,8 @@ def load_config() -> Config:
         asknews_max_calls_per_question=_get_int("ASKNEWS_MAX_CALLS_PER_QUESTION", 2),
         asknews_monthly_cap=_get_int("ASKNEWS_MONTHLY_CAP", 1000),
         max_questions_per_day=_get_int("MAX_QUESTIONS_PER_DAY", 8),
+        min_quota_reserve_for_scheduled_run=_get_int("MIN_QUOTA_RESERVE_FOR_SCHEDULED_RUN", 15),
+        enforce_rate_limit_guard=_get_bool("ENFORCE_RATE_LIMIT_GUARD", True),
         enable_seasonal_tournament=_get_bool("ENABLE_SEASONAL_TOURNAMENT", False),
         calibration_k=_get_float("CALIBRATION_K", 1.0),
         calibration_clip_min=_get_float("CALIBRATION_CLIP_MIN", 0.02),

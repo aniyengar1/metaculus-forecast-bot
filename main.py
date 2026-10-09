@@ -1,8 +1,10 @@
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from dataclasses import replace
+from datetime import datetime, timezone
 
 import dotenv
 
@@ -31,6 +33,7 @@ from metaculus_bot.bot import BudgetSkipped, FutureEvalBot  # noqa: E402
 from metaculus_bot.budget import BudgetGuard  # noqa: E402
 from metaculus_bot.config import load_config  # noqa: E402
 from metaculus_bot.model_health import select_healthy_models  # noqa: E402
+from metaculus_bot.openrouter_quota import get_free_model_daily_quota  # noqa: E402
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -45,6 +48,51 @@ TOURNAMENT_URLS = {
 }
 
 _TYPE_PRIORITY = [BinaryQuestion, MultipleChoiceQuestion, NumericQuestion, DateQuestion, DiscreteQuestion]
+
+# GitHub Actions sets GITHUB_EVENT_NAME=schedule only for cron-triggered runs
+# (not workflow_dispatch, and unset entirely when run locally). The rate
+# limit guard below exempts exactly this case -- it exists to stop
+# local/manual runs from starving the scheduled production run of shared
+# account-wide OpenRouter quota, so the production run itself must never be
+# the thing it blocks.
+IS_SCHEDULED_RUN = os.getenv("GITHUB_EVENT_NAME") == "schedule"
+
+
+def _check_rate_limit_guard(cfg) -> bool:
+    """Returns False if the run should abort. Never calls sys.exit itself --
+    asyncio.run()/nest_asyncio don't propagate SystemExit out of a task
+    cleanly (it surfaces as an ugly 'Task exception was never retrieved'
+    instead of a clean exit), so the actual process exit happens once in
+    __main__, after the event loop has finished."""
+    if IS_SCHEDULED_RUN:
+        return True
+
+    quota = get_free_model_daily_quota()
+    if quota is None:
+        print("⚠️  Could not check OpenRouter free-model quota before starting; proceeding anyway.\n")
+        return True
+
+    print(
+        f"OpenRouter free-model daily quota: {quota.used}/{quota.limit} used, "
+        f"{quota.remaining} remaining.\n"
+    )
+    if quota.remaining < cfg.min_quota_reserve_for_scheduled_run:
+        msg = (
+            f"Only {quota.remaining} OpenRouter free-model request(s) left today (limit "
+            f"{quota.limit}), below the {cfg.min_quota_reserve_for_scheduled_run} reserved for "
+            "the next scheduled production run. This is a local/manual run, and local testing "
+            "shares the same account-wide daily quota as the scheduled MiniBench run."
+        )
+        if cfg.enforce_rate_limit_guard:
+            print(
+                f"🚨 REFUSING TO START: {msg}\n"
+                "Set ENFORCE_RATE_LIMIT_GUARD=false to override (not recommended -- this is "
+                "exactly how production got starved before).\n"
+            )
+            return False
+        else:
+            print(f"⚠️  {msg}\nContinuing anyway because ENFORCE_RATE_LIMIT_GUARD=false.\n")
+    return True
 
 
 def _select_diverse_subset(
@@ -96,10 +144,13 @@ def _fetch_questions(
     return questions
 
 
-async def _run(args: argparse.Namespace) -> None:
+async def _run(args: argparse.Namespace) -> int:
+    """Returns a process exit code (0 success, 1 aborted)."""
     cfg = load_config()
     check_environment(strict=True)
     print_startup_banner(args.mode, will_publish=args.publish)
+    if not _check_rate_limit_guard(cfg):
+        return 1
 
     with db.connect(cfg.db_path) as conn:
         # Fetch and narrow down the question list *before* touching
@@ -114,9 +165,42 @@ async def _run(args: argparse.Namespace) -> None:
             questions = [client.get_question_by_post_id(pid) for pid in ids]
         else:
             questions = _fetch_questions(client, args.mode, args.target, cfg)
+
+        # Log every open question we've ever seen (independent of whether we
+        # forecast it *this* run) so we can tell, on a later run, whether one
+        # closed while we were still deferring it -- see the alert check
+        # right below.
+        for q in questions:
+            db.upsert_seen_question(
+                conn,
+                question_id=q.id_of_question,
+                post_id=q.id_of_post,
+                question_title=q.question_text,
+                question_url=q.page_url,
+                close_time_iso=q.close_time.isoformat() if q.close_time else None,
+            )
+
         skip_previously_forecasted = args.mode != "test_questions"
         if skip_previously_forecasted:
+            already_forecasted = [q for q in questions if q.already_forecasted]
+            for q in already_forecasted:
+                db.mark_question_forecasted(conn, q.id_of_question)
             questions = [q for q in questions if not q.already_forecasted]
+
+        newly_closed = db.find_newly_closed_unforecast(conn)
+        for question_id, title, url, close_time in newly_closed:
+            msg = f"Question closed without ever being forecast: {url} ({title}) -- closed {close_time}"
+            logger.warning(msg)
+            db.log_alert(conn, msg)
+            print(f"🚨 ALERT: {msg}")
+            db.mark_closed_unforecast_alerted(conn, question_id)
+
+        # Soonest-closing first, so a tight daily/--limit cap drops the
+        # questions with the most runway left, not an arbitrary subset.
+        # Questions with no close_time (shouldn't normally happen) sort last.
+        _DISTANT_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+        questions.sort(key=lambda q: q.close_time or _DISTANT_FUTURE)
+
         if args.limit:
             questions = (
                 _select_diverse_subset(questions, args.limit)
@@ -129,14 +213,15 @@ async def _run(args: argparse.Namespace) -> None:
         if remaining_quota < len(questions):
             print(
                 f"Throttling: {questions_today} question(s) already forecast today, "
-                f"cap is {cfg.max_questions_per_day}/day -- processing {remaining_quota} of "
-                f"{len(questions)} found, rest deferred to a later run (not dropped)."
+                f"cap is {cfg.max_questions_per_day}/day -- processing the {remaining_quota} "
+                f"soonest-closing of {len(questions)} found, rest deferred to a later run "
+                "(not dropped -- will be retried, and alerted on if one closes first)."
             )
             questions = questions[:remaining_quota]
 
         if not questions:
             print("Nothing to forecast this run (no new questions, or daily cap reached).\n")
-            return
+            return 0
 
         print(f"Health-checking model pool ({len(cfg.model_pool)} candidates)...")
         selected_models, health_results = await select_healthy_models(
@@ -155,7 +240,7 @@ async def _run(args: argparse.Namespace) -> None:
             logger.error(alert_msg)
             db.log_alert(conn, alert_msg)
             print(f"🚨 ALERT: {alert_msg}\n")
-            sys.exit(1)
+            return 1
 
         effective_n_runs = (
             cfg.target_ensemble_size if len(selected_models) >= cfg.target_ensemble_size else len(selected_models)
@@ -257,6 +342,8 @@ async def _run(args: argparse.Namespace) -> None:
                 cost_usd=actual_cost,
                 status="ok",
             )
+            if question.id_of_question is not None:
+                db.mark_question_forecasted(conn, question.id_of_question)
 
         FutureEvalBot.log_report_summary(reports, raise_errors=False)
         print_run_summary_banner(
@@ -264,6 +351,8 @@ async def _run(args: argparse.Namespace) -> None:
         )
         if skipped_budget:
             print(f"⏭️   {skipped_budget} question(s) skipped due to budget guard.\n")
+
+    return 0
 
 
 if __name__ == "__main__":
@@ -312,4 +401,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    asyncio.run(_run(args))
+    sys.exit(asyncio.run(_run(args)))
