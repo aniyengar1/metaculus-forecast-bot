@@ -179,3 +179,64 @@ needing to re-run this manual investigation. Also added a run-level alert
 quota, and a healthy enough model pool to actually attempt them, but every
 individual attempt still failed, that's now a logged `alerts` row + loud
 print, not silence.
+
+## Multi-provider pool, 2026-10-12
+
+Added Groq and Gemini (both genuinely free, no card on file) as providers
+alongside the OpenRouter :free fallback tier. `DEFAULT_MODEL_POOL` is now
+hand-ordered by priority: `gemini/gemini-3.8-flash`, `groq/openai/gpt-oss-120b`,
+`groq/qwen/qwen3.8-27b`, then the OpenRouter pool. `model_health.py` dropped
+its provider-diversity-dedup logic in favor of pure priority order, since the
+pool itself now intentionally repeats "groq" twice -- the old dedup would
+have skipped the second Groq model and jumped straight to an OpenRouter
+fallback instead, fighting the intended ordering. Verified via `GET
+/v1beta/models` + individual invokes (2026-10-12) that every current Gemini
+Flash/Flash-Lite variant (3.1 through 3.8) responds on the free tier, and
+via `GET /openai/v1/models` that Groq actually hosts `openai/gpt-oss-120b`,
+`openai/gpt-oss-20b`, and `qwen/qwen3.8-27b` right now.
+
+**Per-provider quota** (`metaculus_bot/provider_quota.py`): OpenRouter stays
+live-read (`/api/v1/key`, account-wide). Groq has published fixed per-model
+limits (1000 RPD each, independent per model -- not pooled like OpenRouter)
+that we track our own usage against. Gemini publishes nothing and returns no
+quota headers on success (checked real response headers: only
+`x-gemini-service-tier`, no quota-remaining); we track our own usage against
+a guessed 1000 RPD ceiling until a real 429's `QuotaFailure` body teaches us
+the actual number, then remember it permanently. `compute_daily_question_budget`
+takes the tightest per-model constraint (remaining quota ÷ expected
+calls/question for that model's role -- 1.0 for an ensemble slot, ~1.4 for
+the parser role, measured 2026-10-08/09), applies a 20% margin, and caps at
+`MAX_QUESTIONS_PER_DAY_CEILING` (now a safety ceiling, not the primary
+driver). The parser/summarizer role is a separate pool
+(`gemini/gemini-3.5-flash-lite`, `groq/openai/gpt-oss-20b`), health-checked
+independently so it doesn't just inherit whichever model happened to win the
+main ensemble slot.
+
+**Dry run** (3 recently-closed MiniBench questions, no publish): all 3
+succeeded. Two findings worth flagging:
+
+1. `gemini/gemini-3.8-flash` failed its health check with a transient 503
+   ("high demand... please try again later") during this run, so the
+   ensemble fell back to `groq/openai/gpt-oss-120b` + `groq/qwen/qwen3.8-27b`
+   + an OpenRouter model for all 3 questions. Not a quota issue (503, not
+   429) and not permanent -- `gemini-3.5-flash-lite` (the parser pick) was
+   healthy the same run, so this looks like transient capacity on that one
+   model specifically. The self-healing design did exactly what it's for:
+   recorded as DEAD for this run, ensemble proceeded anyway.
+2. Real per-provider usage this run: Groq 6 requests (3 each, both models),
+   Gemini 4 requests (3 research-summaries + 1 fallback-parse, all via the
+   lite parser model), OpenRouter 3 (one per question, read live rather than
+   locally tracked). All three providers did answer in some role even though
+   gemini-3.8-flash specifically didn't participate as an ensemble member
+   this run.
+3. Unflagged until now: `cost_usd` is no longer always $0 for Groq/Gemini
+   (e.g. $0.0083-0.0159/question this run) -- litellm has real published
+   pricing for these well-known model families (unlike the obscure
+   OpenRouter :free slugs, which litellm doesn't recognize and so reports
+   OpenRouter's own actual-$0 figure for). Since both keys are genuinely
+   free-tier with no card on file, **real spend is still $0** regardless of
+   what litellm's cost estimator assumes -- but the `cost_usd` column and the
+   $ budget guard are now tracking a phantom number for these two providers,
+   not real spend. Low practical risk today (the daily question budget caps
+   volume well before $10/day in phantom cost could accumulate), but worth
+   knowing the $ figures from Groq/Gemini aren't literal going forward.

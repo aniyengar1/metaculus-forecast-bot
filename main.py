@@ -37,6 +37,7 @@ from metaculus_bot.budget import BudgetGuard  # noqa: E402
 from metaculus_bot.config import load_config  # noqa: E402
 from metaculus_bot.model_health import select_healthy_models  # noqa: E402
 from metaculus_bot.openrouter_quota import get_free_model_daily_quota  # noqa: E402
+from metaculus_bot.provider_quota import compute_daily_question_budget  # noqa: E402
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -241,19 +242,8 @@ async def _run(args: argparse.Namespace) -> int:
                 else questions[: args.limit]
             )
 
-        questions_today = db.get_questions_forecast_today(conn)
-        remaining_quota = max(cfg.max_questions_per_day - questions_today, 0)
-        if remaining_quota < len(questions):
-            print(
-                f"Throttling: {questions_today} question(s) already forecast today, "
-                f"cap is {cfg.max_questions_per_day}/day -- processing the {remaining_quota} "
-                f"soonest-closing of {len(questions)} found, rest deferred to a later run "
-                "(not dropped -- will be retried, and alerted on if one closes first)."
-            )
-            questions = questions[:remaining_quota]
-
         if not questions:
-            print("Nothing to forecast this run (no new questions, or daily cap reached).\n")
+            print("Nothing to forecast this run (no new questions).\n")
             return 0
 
         print(f"Health-checking model pool ({len(cfg.model_pool)} candidates)...")
@@ -275,6 +265,16 @@ async def _run(args: argparse.Namespace) -> int:
             print(f"🚨 ALERT: {alert_msg}\n")
             return 1
 
+        print(f"Health-checking parser pool ({len(cfg.parser_model_pool)} candidates)...")
+        parser_candidates, parser_health_results = await select_healthy_models(
+            cfg.parser_model_pool, target_count=1
+        )
+        for r in parser_health_results:
+            status = "healthy" if r.healthy else f"DEAD -- {r.error}"
+            print(f"  {r.model:<55} {status}")
+        parser_model = parser_candidates[0] if parser_candidates else selected_models[0]
+        print(f"Parser/summarizer model: {parser_model}\n")
+
         effective_n_runs = (
             cfg.target_ensemble_size if len(selected_models) >= cfg.target_ensemble_size else len(selected_models)
         )
@@ -282,8 +282,33 @@ async def _run(args: argparse.Namespace) -> int:
             cfg,
             models=selected_models,
             n_runs=effective_n_runs,
-            parser_model=selected_models[0],
+            parser_model=parser_model,
         )
+
+        # Real per-provider remaining quota, not a static guess -- see
+        # metaculus_bot/provider_quota.py. Computed only now because it needs
+        # to know which specific models (incl. the parser) are actually in
+        # play this run.
+        daily_budget = compute_daily_question_budget(
+            selected_models, parser_model, conn, ceiling=cfg.max_questions_per_day_ceiling
+        )
+        questions_today = db.get_questions_forecast_today(conn)
+        remaining_quota = max(daily_budget - questions_today, 0)
+        print(
+            f"Computed daily question budget: {daily_budget} (ceiling {cfg.max_questions_per_day_ceiling}), "
+            f"{questions_today} already forecast today -> {remaining_quota} remaining.\n"
+        )
+        if remaining_quota < len(questions):
+            print(
+                f"Throttling: processing the {remaining_quota} soonest-closing of {len(questions)} "
+                "found, rest deferred to a later run (not dropped -- will be retried, and alerted "
+                "on if one closes first)."
+            )
+            questions = questions[:remaining_quota]
+
+        if not questions:
+            print("Nothing to forecast this run (daily quota-derived cap reached).\n")
+            return 0
 
         spent_today = db.get_cost_spent_today(conn)
         budget_guard = BudgetGuard(cfg, spent_today)

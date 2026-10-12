@@ -11,34 +11,48 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-# Free OpenRouter models spanning 3+ providers, verified via
-# https://openrouter.ai/api/v1/models to support structured outputs/tool
-# calling. Swap to paid frontier models once Metaculus LLM credits are
-# confirmed (see docs/PHASE1_RESEARCH.md).
+# Free-tier models across 3 real providers (Gemini, Groq, OpenRouter),
+# verified working on 2026-10-12 (see docs/STAGE_B_PLAN.md "Multi-provider
+# pool"). Priority order matters: gemini-3.8-flash and the two Groq models
+# are the primary picks (each a genuinely different company/API, not just a
+# different model on the same shared OpenRouter free pool), with the
+# OpenRouter :free pool kept purely as a fallback tier if gemini/groq are
+# both unhealthy. `model_health.select_healthy_models` now walks this list
+# in order and takes the first `target_ensemble_size` healthy entries --
+# no provider-diversity dedup, since the ordering already encodes that.
 #
 # `models` is the static fallback ensemble (used only if something
 # constructs the bot without going through the health-check flow, e.g.
 # tests). The real run path (main.py) always health-checks `model_pool` at
-# startup and substitutes whichever 3 come back healthy -- see
-# metaculus_bot/model_health.py. Free-tier model availability churns fast
-# (two different models broke in two different ways within 48h on
-# 2026-10-05/06: one rate-limited, one permanently retired/paywalled), which
-# is exactly why the pool has 6 candidates across 6 providers instead of a
-# hand-picked 3.
+# startup and substitutes whichever N come back healthy.
 DEFAULT_MODELS = [
-    "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
-    "openrouter/apodex/apodex-1.1-mini:free",
-    "openrouter/qwen/qwen3.8-27b:free",
+    "gemini/gemini-3.8-flash",
+    "groq/openai/gpt-oss-120b",
+    "groq/qwen/qwen3.8-27b",
 ]
 DEFAULT_MODEL_POOL = [
+    "gemini/gemini-3.8-flash",
+    "groq/openai/gpt-oss-120b",
+    "groq/qwen/qwen3.8-27b",
+    # OpenRouter :free fallback tier -- only reached if gemini/groq are both
+    # unhealthy. Free-tier availability churns fast there (two different
+    # models broke in two different ways within 48h on 2026-10-05/06: one
+    # rate-limited, one permanently retired/paywalled), hence several
+    # candidates rather than one.
     "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
     "openrouter/apodex/apodex-1.1-mini:free",
-    "openrouter/qwen/qwen3.8-27b:free",  # retired/paywalled as of 2026-10-07; kept in case it returns
-    "openrouter/google/gemma-4-26b-a4b-it:free",  # rate-limited 2026-10-05; 429s are transient, kept as candidate
     "openrouter/inclusionai/ling-3.0-flash-sante:free",
     "openrouter/dots-studio/dots-3-note-preview:free",
 ]
-DEFAULT_PARSER_MODEL = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+# Lighter-weight models for the parser/summarizer role (structured-output
+# parsing fallback + research summarization) -- doesn't need frontier
+# reasoning, just reliable instruction-following, so default to the
+# cheapest-quota tier rather than reusing a primary ensemble slot.
+DEFAULT_PARSER_MODEL_POOL = [
+    "gemini/gemini-3.5-flash-lite",
+    "groq/openai/gpt-oss-20b",
+]
+DEFAULT_PARSER_MODEL = "gemini/gemini-3.5-flash-lite"
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -80,6 +94,7 @@ class Config:
     # Ensemble
     models: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
     model_pool: list[str] = field(default_factory=lambda: list(DEFAULT_MODEL_POOL))
+    parser_model_pool: list[str] = field(default_factory=lambda: list(DEFAULT_PARSER_MODEL_POOL))
     target_ensemble_size: int = 3
     n_runs: int = 3
     parser_model: str = DEFAULT_PARSER_MODEL
@@ -102,21 +117,14 @@ class Config:
     asknews_max_calls_per_question: int = 2
     asknews_monthly_cap: int = 1000
 
-    # OpenRouter free-tier rate limit is account-wide across ALL ":free"
-    # models combined: 20 requests/minute always, and either 50/day (no
-    # lifetime credits purchased) or 1000/day (>=$10 purchased once -- a
-    # one-time real-money account upgrade, unrelated to Metaculus's
-    # sponsored *model* credits). Deterministic regex parsing
-    # (metaculus_bot/deterministic_parse.py) handles ~87% of model outputs
-    # with zero extra requests, falling back to an LLM parser call only when
-    # it can't; measured average is ~4.4 requests/question (1
-    # research-summary + 3 forecast calls, occasionally +1 fallback parse),
-    # plus ~6-10 for a model health-check pass (once per run that has new
-    # questions). Default of 8 is sized for the 50/day tier (~5/question
-    # planning number w/ ~20% margin, minus a 10-request health-check
-    # reserve); see docs/STAGE_B_PLAN.md for the full math. Raise this (e.g.
-    # to ~70) once $10 of OpenRouter credit has been purchased.
-    max_questions_per_day: int = 8
+    # As of 2026-10-12 the real daily throttle is computed dynamically each
+    # run from actual remaining per-provider quota (metaculus_bot.provider_quota
+    # .compute_daily_question_budget, with a 20% margin) across whichever
+    # models are actually selected that run. This field is now just a hard
+    # safety ceiling the computed value can never exceed, in case the quota
+    # math is ever wrong in a way that would ask for too many questions --
+    # it does not drive normal-day behavior anymore. See docs/STAGE_B_PLAN.md.
+    max_questions_per_day_ceiling: int = 20
 
     # Pre-flight OpenRouter quota guard for local/manual runs only (the
     # actual scheduled cron run is exempt -- see main.py's IS_SCHEDULED_RUN).
@@ -143,6 +151,7 @@ def load_config() -> Config:
     return Config(
         models=_get_list("BOT_MODELS", DEFAULT_MODELS),
         model_pool=_get_list("BOT_MODEL_POOL", DEFAULT_MODEL_POOL),
+        parser_model_pool=_get_list("BOT_PARSER_MODEL_POOL", DEFAULT_PARSER_MODEL_POOL),
         target_ensemble_size=_get_int("BOT_TARGET_ENSEMBLE_SIZE", 3),
         n_runs=_get_int("BOT_N_RUNS", 3),
         parser_model=os.getenv("BOT_PARSER_MODEL", DEFAULT_PARSER_MODEL),
@@ -159,7 +168,7 @@ def load_config() -> Config:
         ),
         asknews_max_calls_per_question=_get_int("ASKNEWS_MAX_CALLS_PER_QUESTION", 2),
         asknews_monthly_cap=_get_int("ASKNEWS_MONTHLY_CAP", 1000),
-        max_questions_per_day=_get_int("MAX_QUESTIONS_PER_DAY", 8),
+        max_questions_per_day_ceiling=_get_int("MAX_QUESTIONS_PER_DAY_CEILING", 20),
         min_quota_reserve_for_scheduled_run=_get_int("MIN_QUOTA_RESERVE_FOR_SCHEDULED_RUN", 15),
         enforce_rate_limit_guard=_get_bool("ENFORCE_RATE_LIMIT_GUARD", True),
         enable_seasonal_tournament=_get_bool("ENABLE_SEASONAL_TOURNAMENT", False),

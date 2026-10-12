@@ -64,6 +64,7 @@ from metaculus_bot.deterministic_parse import (
     parse_numeric_percentiles,
 )
 from metaculus_bot.llm_retry import invoke_with_backoff
+from metaculus_bot import provider_quota
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +209,7 @@ class FutureEvalBot(ForecastBot):
             llm = GeneralLlm(model=model_name, temperature=0.3, allowed_tries=3)
             prompt = self._binary_prompt(question, research_text)
             reasoning = await invoke_with_backoff(llm, prompt)
+            provider_quota.record_usage(self.db_conn, model_name)
 
             value = parse_binary(reasoning)
             parse_method = "deterministic"
@@ -224,12 +226,14 @@ class FutureEvalBot(ForecastBot):
                 )
                 value = max(0.01, min(0.99, parsed.prediction_in_decimal))
                 parse_method = "llm_fallback"
+                provider_quota.record_usage(self.db_conn, self.cfg.parser_model)
 
             return ModelRunResult(
                 model=model_name, run_index=run_index, raw_text=reasoning, value=value, parse_method=parse_method
             )
         except Exception as e:
             logger.warning(f"Model run failed (binary, model={model_name}, run={run_index}): {e}")
+            provider_quota.handle_possible_quota_error(self.db_conn, model_name, e)
             return ModelRunResult(model=model_name, run_index=run_index, error=f"{type(e).__name__}: {e}")
 
     async def _run_forecast_on_binary(
@@ -307,6 +311,7 @@ class FutureEvalBot(ForecastBot):
             llm = GeneralLlm(model=model_name, temperature=0.3, allowed_tries=3)
             prompt = self._mc_prompt(question, research_text)
             reasoning = await invoke_with_backoff(llm, prompt)
+            provider_quota.record_usage(self.db_conn, model_name)
 
             parsed = parse_multiple_choice(reasoning, question.options)
             parse_method = "deterministic"
@@ -330,12 +335,14 @@ class FutureEvalBot(ForecastBot):
                     additional_instructions=parsing_instructions,
                 )
                 parse_method = "llm_fallback"
+                provider_quota.record_usage(self.db_conn, self.cfg.parser_model)
 
             return ModelRunResult(
                 model=model_name, run_index=run_index, raw_text=reasoning, value=parsed, parse_method=parse_method
             )
         except Exception as e:
             logger.warning(f"Model run failed (MC, model={model_name}, run={run_index}): {e}")
+            provider_quota.handle_possible_quota_error(self.db_conn, model_name, e)
             return ModelRunResult(model=model_name, run_index=run_index, error=f"{type(e).__name__}: {e}")
 
     async def _run_forecast_on_multiple_choice(
@@ -493,6 +500,7 @@ class FutureEvalBot(ForecastBot):
             llm = GeneralLlm(model=model_name, temperature=0.3, allowed_tries=3)
             prompt = self._numeric_prompt(question, research_text)
             reasoning = await invoke_with_backoff(llm, prompt)
+            provider_quota.record_usage(self.db_conn, model_name)
 
             percentiles = parse_numeric_percentiles(reasoning)
             parse_method = "deterministic"
@@ -508,6 +516,7 @@ class FutureEvalBot(ForecastBot):
                     num_validation_samples=self._structure_output_validation_samples,
                 )
                 parse_method = "llm_fallback"
+                provider_quota.record_usage(self.db_conn, self.cfg.parser_model)
 
             distribution = build_pchip_numeric_distribution(percentiles, question)
             return ModelRunResult(
@@ -519,6 +528,7 @@ class FutureEvalBot(ForecastBot):
             )
         except Exception as e:
             logger.warning(f"Model run failed (numeric, model={model_name}, run={run_index}): {e}")
+            provider_quota.handle_possible_quota_error(self.db_conn, model_name, e)
             return ModelRunResult(model=model_name, run_index=run_index, error=f"{type(e).__name__}: {e}")
 
     async def _run_forecast_on_numeric(
@@ -553,6 +563,7 @@ class FutureEvalBot(ForecastBot):
             llm = GeneralLlm(model=model_name, temperature=0.3, allowed_tries=3)
             prompt = self._date_prompt(question, research_text)
             reasoning = await invoke_with_backoff(llm, prompt)
+            provider_quota.record_usage(self.db_conn, model_name)
 
             date_percentiles = parse_date_percentiles(reasoning)
             parse_method = "deterministic"
@@ -568,6 +579,7 @@ class FutureEvalBot(ForecastBot):
                     num_validation_samples=self._structure_output_validation_samples,
                 )
                 parse_method = "llm_fallback"
+                provider_quota.record_usage(self.db_conn, self.cfg.parser_model)
 
             percentiles = [
                 Percentile(percentile=dp.percentile, value=dp.value.timestamp())
@@ -583,6 +595,7 @@ class FutureEvalBot(ForecastBot):
             )
         except Exception as e:
             logger.warning(f"Model run failed (date, model={model_name}, run={run_index}): {e}")
+            provider_quota.handle_possible_quota_error(self.db_conn, model_name, e)
             return ModelRunResult(model=model_name, run_index=run_index, error=f"{type(e).__name__}: {e}")
 
     async def _run_forecast_on_date(

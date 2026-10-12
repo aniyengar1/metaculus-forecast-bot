@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 from forecasting_tools import GeneralLlm, MetaculusQuestion, clean_indents
 
-from metaculus_bot import db
+from metaculus_bot import db, provider_quota
 from metaculus_bot.config import Config, asknews_creds_present
 
 logger = logging.getLogger(__name__)
@@ -148,8 +148,10 @@ async def gather_research(
     )
     try:
         summary = await summarizer_llm.invoke(prompt)
+        provider_quota.record_usage(conn, summarizer_llm.model)
     except Exception as e:
         logger.warning(f"Research summarization failed, using raw research: {e}")
+        provider_quota.handle_possible_quota_error(conn, summarizer_llm.model, e)
         summary = raw
 
     return f"[research source: {source}]\n{summary}"

@@ -1,14 +1,21 @@
 """
 Self-healing model roster: before each run, health-checks every candidate in
-cfg.model_pool with a tiny request, then selects up to `target_count` healthy
-models preferring one-per-provider coverage.
+cfg.model_pool with a tiny request, then selects the first `target_count`
+healthy models in pool order.
 
-Free-tier OpenRouter model availability churns: a model can get transiently
+Free-tier model availability churns: a model can get transiently
 rate-limited (HTTP 429 -- retried with backoff, see llm_retry.py) or
 permanently retired/paywalled (HTTP 404 "unavailable for free" -- not
 retried, since no amount of waiting fixes that). Both are treated as "not
 healthy for this run" here; the caller decides what to do if too few models
 survive (main.py aborts the run rather than forecast with <2 models).
+
+Selection is pure priority order, not provider-diversity-dedup: as of
+2026-10-12 the pool is explicitly hand-ordered (gemini, then 2 distinct Groq
+models, then an OpenRouter :free fallback tier), so preferring one-per-
+provider would actually fight the intended ordering -- it would skip the
+second (intentional) Groq model in favor of jumping straight to the
+OpenRouter fallback tier. See docs/STAGE_B_PLAN.md "Multi-provider pool".
 """
 from __future__ import annotations
 
@@ -25,11 +32,6 @@ logger = logging.getLogger(__name__)
 _HEALTH_CHECK_PROMPT = "Reply with exactly one word: OK"
 _HEALTH_CHECK_TIMEOUT_SECONDS = 20
 _HEALTH_CHECK_MAX_TRIES = 3  # reuses the same backoff as real forecast calls
-
-
-def _provider_of(model: str) -> str:
-    bare = model.split("/", 1)[-1] if model.startswith("openrouter/") else model
-    return bare.split("/", 1)[0]
 
 
 @dataclass
@@ -57,26 +59,10 @@ async def select_healthy_models(
 ) -> tuple[list[str], list[HealthResult]]:
     """
     Health-checks every model in `model_pool` concurrently, then returns
-    (selected, all_results). `selected` is capped at `target_count`,
-    preferring to cover distinct providers before repeating one, and
-    preserving the pool's ordering as the tiebreak within each pass.
+    (selected, all_results). `selected` is the first `target_count` healthy
+    models in pool order.
     """
     results = await asyncio.gather(*[_check_one(m) for m in model_pool])
-    healthy = [r.model for r in results if r.healthy]
-
-    selected: list[str] = []
-    seen_providers: set[str] = set()
-    for model in healthy:
-        if len(selected) >= target_count:
-            break
-        provider = _provider_of(model)
-        if provider not in seen_providers:
-            selected.append(model)
-            seen_providers.add(provider)
-    for model in healthy:
-        if len(selected) >= target_count:
-            break
-        if model not in selected:
-            selected.append(model)
-
+    results_by_model = {r.model: r for r in results}
+    selected = [m for m in model_pool if results_by_model[m].healthy][:target_count]
     return selected, results

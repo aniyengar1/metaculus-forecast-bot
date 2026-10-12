@@ -3,13 +3,19 @@ name: Forecast on MiniBench
 # MiniBench only -- the seasonal tournament (fall-futureeval-2026) stays off
 # via the ENABLE_SEASONAL_TOURNAMENT config flag (defaults False in
 # metaculus_bot/config.py) until paid LLM credits + stronger models are
-# confirmed. See docs/STAGE_B_PLAN.md for the free-tier rate-limit math
-# behind the cron interval and MAX_QUESTIONS_PER_DAY throttle.
+# confirmed. See docs/STAGE_B_PLAN.md for the per-provider quota math behind
+# the daily question budget.
+#
+# Every 15 min, not every 2h: MiniBench questions are only open ~3h each
+# (confirmed 2026-10-11 diagnosis), so a coarser poll risks missing some
+# entirely. The concurrency group below (already in place since Stage B)
+# means a run that's still going when the next trigger fires queues instead
+# of overlapping -- runs never race each other on the data branch.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "15 */2 * * *" # every 2 hours, offset off the hour
+    - cron: "*/15 * * * *" # every 15 minutes
 
 concurrency:
   group: ${{ github.workflow }}
@@ -43,6 +49,8 @@ jobs:
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
@@ -50,7 +58,7 @@ jobs:
           # Secrets) if you want to change these without a code change.
           # Empty/unset falls back to the code default in config.py.
           MAX_COST_PER_DAY: ${{ vars.MAX_COST_PER_DAY }}
-          MAX_QUESTIONS_PER_DAY: ${{ vars.MAX_QUESTIONS_PER_DAY }}
+          MAX_QUESTIONS_PER_DAY_CEILING: ${{ vars.MAX_QUESTIONS_PER_DAY_CEILING }}
           ENABLE_SEASONAL_TOURNAMENT: ${{ vars.ENABLE_SEASONAL_TOURNAMENT }}
       - name: Persist forecast DB to data branch
         if: always()

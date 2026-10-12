@@ -66,6 +66,22 @@ CREATE TABLE IF NOT EXISTS alerts (
     timestamp TEXT NOT NULL,
     message TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS provider_usage (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    date TEXT NOT NULL,
+    requests_used INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (provider, model, date)
+);
+
+CREATE TABLE IF NOT EXISTS provider_learned_limits (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    rpd_limit INTEGER NOT NULL,
+    learned_at TEXT NOT NULL,
+    PRIMARY KEY (provider, model)
+);
 """
 
 
@@ -243,3 +259,49 @@ def mark_closed_unforecast_alerted(conn: sqlite3.Connection, question_id: int) -
         (question_id,),
     )
     conn.commit()
+
+
+def _today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def increment_provider_usage(
+    conn: sqlite3.Connection, provider: str, model: str, n: int = 1
+) -> int:
+    today = _today()
+    conn.execute(
+        """
+        INSERT INTO provider_usage (provider, model, date, requests_used) VALUES (?, ?, ?, ?)
+        ON CONFLICT(provider, model, date) DO UPDATE SET requests_used = requests_used + excluded.requests_used
+        """,
+        (provider, model, today, n),
+    )
+    conn.commit()
+    return get_provider_usage_today(conn, provider, model)
+
+
+def get_provider_usage_today(conn: sqlite3.Connection, provider: str, model: str) -> int:
+    row = conn.execute(
+        "SELECT requests_used FROM provider_usage WHERE provider = ? AND model = ? AND date = ?",
+        (provider, model, _today()),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def set_learned_rpd_limit(conn: sqlite3.Connection, provider: str, model: str, rpd: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO provider_learned_limits (provider, model, rpd_limit, learned_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(provider, model) DO UPDATE SET rpd_limit = excluded.rpd_limit, learned_at = excluded.learned_at
+        """,
+        (provider, model, rpd, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def get_learned_rpd_limit(conn: sqlite3.Connection, provider: str, model: str) -> int | None:
+    row = conn.execute(
+        "SELECT rpd_limit FROM provider_learned_limits WHERE provider = ? AND model = ?",
+        (provider, model),
+    ).fetchone()
+    return int(row[0]) if row else None
