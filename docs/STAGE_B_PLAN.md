@@ -131,3 +131,51 @@ Built after confirming the problem was real, not hypothetical: a `GET
 /api/v1/key` check mid-writing-this showed `used: 53, limit: 50, remaining: 0`
 -- our own Stage A/B testing earlier had already exhausted the account's
 real daily cap.
+
+## MiniBench "0 open questions" diagnosis, 2026-10-11
+
+Investigated whether `forecasting_tools.get_all_open_questions_from_tournament`
+was dropping real open questions via a filter bug.
+
+**1. Unfiltered API hit.** `GET /api/posts/?tournaments=minibench&limit=100`
+(no status param) returned **59 questions total, all `status: closed`**, and
+every single one had `open_time`/`scheduled_close_time` exactly **3.0 hours**
+apart (min=max=3.0h across all 59 -- not a round-long window per question).
+`open_time` range: 2026-10-05 00:07 UTC to 2026-10-07 20:38 UTC. Nothing newer
+exists in the API (`offset=100` page is empty). So this round's full ~59-60
+question batch already opened *and closed* entirely within its first ~3 days,
+each question living only 3 hours -- not spread continuously across the
+Oct 5-23 window as the site's date range might suggest.
+
+**2. Filter comparison.** `forecasting_tools`' filter is just
+`allowed_statuses=["open"]`. Since our own unfiltered pull agrees 100% of
+real rows are `closed`, filtering to `open` correctly returns 0 -- **not a
+filter bug.** `already_forecasted`-exclusion, our close-time sort, and the
+daily cap are all downstream of this fetch and never even execute when 0
+questions come back, so none of those contributed either.
+
+**3. Why 0 right now, and is our schedule fast enough.** We weren't running
+yet when this batch's window was open (first real commit/deploy was
+2026-10-08-09, this batch had already fully closed by 2026-10-07 23:38) --
+we simply weren't there for it, not a bug. We can't predict exactly when the
+*next* batch appears (the Oct5-7 window looks like a steady ~1 new
+question/1.15h drip rather than a single release, so either the round pauses
+between batches or something else determines cadence -- not enough signal to
+say which). What we *can* confirm mechanically: every observed question had a
+3-hour open window, and our schedule polls every 2 hours (< 3h), so once a
+next batch starts, we should catch each question within its window with
+margin, same as this diagnosis itself (`main.py --target minibench`) finding
+`total=59 (closed=59) -- of 0 open: ...` -- i.e. confirmed working, nothing to
+fix here, just waiting on the tournament.
+
+**4. Per-run breakdown logging.** Added to `main.py`
+(`_fetch_one_tournament_with_diagnostics`): every run now fetches the
+tournament *unfiltered* (not just the open-only call) and logs
+`total=N (status=count, ...) -- of M open: K already forecasted, J still need
+forecasting` per tournament, so a future "0 found" is immediately
+distinguishable as "genuinely nothing open" vs "something's wrong" without
+needing to re-run this manual investigation. Also added a run-level alert
+(`attempted_count > 0 and successful_count == 0`): if we had open questions,
+quota, and a healthy enough model pool to actually attempt them, but every
+individual attempt still failed, that's now a logged `alerts` row + loud
+print, not silence.

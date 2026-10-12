@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import sys
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -18,6 +19,7 @@ from bot_helpers import (
 silence_noisy_dependencies()
 
 from forecasting_tools import (  # noqa: E402
+    ApiFilter,
     BinaryQuestion,
     DateQuestion,
     DiscreteQuestion,
@@ -27,6 +29,7 @@ from forecasting_tools import (  # noqa: E402
     MultipleChoiceQuestion,
     NumericQuestion,
 )
+from forecasting_tools.data_models.questions import QuestionState  # noqa: E402
 
 from metaculus_bot import db  # noqa: E402
 from metaculus_bot.bot import BudgetSkipped, FutureEvalBot  # noqa: E402
@@ -120,17 +123,47 @@ def _select_diverse_subset(
     return selected[:limit]
 
 
-def _fetch_questions(
+async def _fetch_one_tournament_with_diagnostics(
+    client: MetaculusClient, tournament_id: int | str, label: str
+) -> list[MetaculusQuestion]:
+    """Fetches EVERY question in the tournament regardless of status (not
+    just open ones), logs a full breakdown (total / by status / open-but-
+    already-forecasted / open-and-still-needs-forecasting), and returns only
+    the open-and-not-yet-forecasted ones. This exists so 'Returning 0
+    questions' in forecasting_tools' own logs (which only ever reports the
+    post-filter count) can be distinguished from a filter bug: if our own
+    unfiltered count also says 0 (or 0 open), the filter is working
+    correctly and there's just nothing to forecast right now."""
+    api_filter = ApiFilter(allowed_tournaments=[tournament_id])  # no status/type restriction
+    all_questions = await client.get_questions_matching_filter(api_filter)
+
+    by_status = Counter(q.state.value if q.state else "unknown" for q in all_questions)
+    open_questions = [q for q in all_questions if q.state == QuestionState.OPEN]
+    already_forecasted = [q for q in open_questions if q.already_forecasted]
+    not_yet_forecasted = [q for q in open_questions if not q.already_forecasted]
+
+    status_breakdown = ", ".join(f"{status}={count}" for status, count in by_status.items())
+    print(
+        f"[{label}] tournament breakdown: total={len(all_questions)} ({status_breakdown or 'none'}) "
+        f"-- of {len(open_questions)} open: {len(already_forecasted)} already forecasted, "
+        f"{len(not_yet_forecasted)} still need forecasting"
+    )
+    return not_yet_forecasted
+
+
+async def _fetch_questions(
     client: MetaculusClient, mode: str, target: str, cfg
 ) -> list[MetaculusQuestion]:
     if mode == "test_questions":
-        return client.get_all_open_questions_from_tournament("bot-testing-area")
+        return await _fetch_one_tournament_with_diagnostics(
+            client, "bot-testing-area", "bot-testing-area"
+        )
 
     questions: list[MetaculusQuestion] = []
     if target in ("both", "seasonal"):
         if cfg.enable_seasonal_tournament:
-            questions += client.get_all_open_questions_from_tournament(
-                client.CURRENT_AI_COMPETITION_ID
+            questions += await _fetch_one_tournament_with_diagnostics(
+                client, client.CURRENT_AI_COMPETITION_ID, "seasonal"
             )
         else:
             print(
@@ -138,8 +171,8 @@ def _fetch_questions(
                 "-- set it once paid credits + stronger models are confirmed)"
             )
     if target in ("both", "minibench"):
-        questions += client.get_all_open_questions_from_tournament(
-            client.CURRENT_MINIBENCH_ID
+        questions += await _fetch_one_tournament_with_diagnostics(
+            client, client.CURRENT_MINIBENCH_ID, "minibench"
         )
     return questions
 
@@ -164,7 +197,7 @@ async def _run(args: argparse.Namespace) -> int:
             ids = [int(x.strip()) for x in args.post_ids.split(",") if x.strip()]
             questions = [client.get_question_by_post_id(pid) for pid in ids]
         else:
-            questions = _fetch_questions(client, args.mode, args.target, cfg)
+            questions = await _fetch_questions(client, args.mode, args.target, cfg)
 
         # Log every open question we've ever seen (independent of whether we
         # forecast it *this* run) so we can tell, on a later run, whether one
@@ -285,6 +318,8 @@ async def _run(args: argparse.Namespace) -> int:
 
         reports = []
         skipped_budget = 0
+        successful_count = 0
+        attempted_count = len(questions)
         for question in questions:
             try:
                 report = await bot.forecast_question(question, return_exceptions=True)
@@ -320,6 +355,7 @@ async def _run(args: argparse.Namespace) -> int:
                 continue
 
             reports.append(report)
+            successful_count += 1
             actual_cost = report.price_estimate or 0.0
             budget_guard.record_actual(actual_cost)
             key = question.id_of_post or question.id_of_question or id(question)
@@ -351,6 +387,16 @@ async def _run(args: argparse.Namespace) -> int:
         )
         if skipped_budget:
             print(f"⏭️   {skipped_budget} question(s) skipped due to budget guard.\n")
+
+        if attempted_count > 0 and successful_count == 0:
+            alert_msg = (
+                f"Attempted {attempted_count} open question(s) this run but forecast 0 "
+                "successfully -- model pool was healthy enough to start, so every individual "
+                "attempt must have failed/errored. See the per-question errors above."
+            )
+            logger.error(alert_msg)
+            db.log_alert(conn, alert_msg)
+            print(f"🚨 ALERT: {alert_msg}\n")
 
     return 0
 
