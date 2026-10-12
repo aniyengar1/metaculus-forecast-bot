@@ -120,10 +120,14 @@ def compute_daily_question_budget(
     conn: sqlite3.Connection,
     ceiling: int,
     margin: float = 1.2,
+    reserve: int = 0,
 ) -> int:
     """The actual daily throttle: the tightest "how many more questions can
     this model's remaining quota support, given its role" across every model
-    in play this run, divided by `margin` for safety, capped at `ceiling`."""
+    in play this run, divided by `margin` for safety, minus `reserve`
+    (headroom deliberately left for another consumer of the same shared
+    provider quota -- see MiniBench-priority in docs/STAGE_B_PLAN.md), capped
+    at `ceiling`."""
     per_model_question_budgets: list[float] = []
 
     for model in selected_models:
@@ -137,7 +141,41 @@ def compute_daily_question_budget(
 
     if not per_model_question_budgets:
         logger.warning("Could not determine remaining quota for any model; using the hard ceiling.")
-        return ceiling
+        return max(ceiling - reserve, 0)
 
-    computed = int(min(per_model_question_budgets) / margin)
+    computed = int(min(per_model_question_budgets) / margin) - reserve
     return max(min(computed, ceiling), 0)
+
+
+# Providers confirmed free-tier with no card on file (groq, gemini: per the
+# account used to build this bot; openrouter: only the ":free"-suffixed
+# models specifically). litellm has real published pricing for Groq/Gemini's
+# well-known model families and reports a non-zero price_estimate for them
+# accordingly, but that's not real spend on a card-free free-tier key -- see
+# split_real_and_estimated_cost, which is what the $ budget guard actually
+# uses.
+_ALWAYS_FREE_PROVIDERS = {"groq", "gemini"}
+
+
+def is_free_tier_provider(model: str) -> bool:
+    provider = provider_of(model)
+    if provider in _ALWAYS_FREE_PROVIDERS:
+        return True
+    if provider == "openrouter":
+        return model.endswith(":free")
+    return False
+
+
+def split_real_and_estimated_cost(
+    models_used: set[str], litellm_estimate: float
+) -> tuple[float, float]:
+    """Returns (real_cost_usd, estimated_cost_usd). `real_cost_usd` is what
+    the $/question and $/day budget guards should actually use -- 0.0 if
+    every model that contributed to this question is a confirmed free-tier
+    provider, regardless of what litellm's estimate says. `estimated_cost_usd`
+    is always just litellm's raw number, kept for reference/future paid-model
+    comparison. If models_used is empty (shouldn't normally happen) we fall
+    back to treating the litellm estimate as real, the safe default."""
+    if models_used and all(is_free_tier_provider(m) for m in models_used):
+        return 0.0, litellm_estimate
+    return litellm_estimate, litellm_estimate

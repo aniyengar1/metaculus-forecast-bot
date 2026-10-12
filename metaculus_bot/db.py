@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS forecasts (
     models_used TEXT,
     n_runs INTEGER,
     cost_usd REAL,
+    estimated_cost_usd REAL,
+    tournament TEXT,
     status TEXT NOT NULL,
     error_message TEXT
 );
@@ -85,6 +87,24 @@ CREATE TABLE IF NOT EXISTS provider_learned_limits (
 """
 
 
+# Columns added after the `forecasts` table's first release. CREATE TABLE IF
+# NOT EXISTS is a no-op against an already-existing table (e.g. the
+# persisted data-branch DB from earlier runs), so new columns need an
+# explicit migration rather than just appearing in SCHEMA above.
+_FORECASTS_TABLE_MIGRATIONS = [
+    ("estimated_cost_usd", "REAL"),
+    ("tournament", "TEXT"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(forecasts)")}
+    for column, sql_type in _FORECASTS_TABLE_MIGRATIONS:
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE forecasts ADD COLUMN {column} {sql_type}")
+    conn.commit()
+
+
 @contextmanager
 def connect(db_path: str) -> Iterator[sqlite3.Connection]:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
@@ -92,6 +112,7 @@ def connect(db_path: str) -> Iterator[sqlite3.Connection]:
     try:
         conn.executescript(SCHEMA)
         conn.commit()
+        _migrate(conn)
         yield conn
     finally:
         conn.close()
@@ -115,6 +136,8 @@ def log_forecast(
     n_runs: int,
     cost_usd: float | None,
     status: str,
+    estimated_cost_usd: float | None = None,
+    tournament: str | None = None,
     error_message: str | None = None,
 ) -> int:
     cur = conn.execute(
@@ -123,8 +146,8 @@ def log_forecast(
             run_timestamp, question_id, post_id, question_title, question_type,
             question_url, research_summary, raw_model_outputs, aggregate_value,
             post_calibration_value, submitted_value, dry_run, models_used,
-            n_runs, cost_usd, status, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            n_runs, cost_usd, estimated_cost_usd, tournament, status, error_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
@@ -142,6 +165,8 @@ def log_forecast(
             json.dumps(models_used),
             n_runs,
             cost_usd,
+            estimated_cost_usd,
+            tournament,
             status,
             error_message,
         ),
@@ -305,3 +330,37 @@ def get_learned_rpd_limit(conn: sqlite3.Connection, provider: str, model: str) -
         (provider, model),
     ).fetchone()
     return int(row[0]) if row else None
+
+
+def get_last_forecast_time(conn: sqlite3.Connection, question_id: int) -> datetime | None:
+    """Most recent successful (status='ok') forecast timestamp for this
+    question, from our own log -- used to decide whether a still-open
+    seasonal question is stale enough to re-forecast."""
+    row = conn.execute(
+        "SELECT MAX(run_timestamp) FROM forecasts WHERE question_id = ? AND status = 'ok'",
+        (question_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    return datetime.fromisoformat(row[0])
+
+
+def count_reforecasts_today(conn: sqlite3.Connection) -> int:
+    """How many of today's successful forecasts are a *re*-forecast (i.e.
+    this question already had an earlier successful forecast, today or any
+    prior day) -- for the max_reforecasts_per_day cap."""
+    today = _today()
+    row = conn.execute(
+        """
+        SELECT COUNT(*) FROM forecasts f1
+        WHERE f1.status = 'ok' AND substr(f1.run_timestamp, 1, 10) = ?
+          AND EXISTS (
+              SELECT 1 FROM forecasts f2
+              WHERE f2.question_id = f1.question_id
+                AND f2.status = 'ok'
+                AND f2.run_timestamp < f1.run_timestamp
+          )
+        """,
+        (today,),
+    ).fetchone()
+    return int(row[0] or 0)

@@ -7,9 +7,15 @@ litellm/OpenRouter after each call) -- record_actual() folds that real number
 back into the running daily total so later questions in the same run see it.
 
 Pricing lookup:
-- Models whose name ends in ":free" are hard-coded to $0/token, since
-  OpenRouter guarantees those calls are free regardless of what litellm's
-  static pricing table knows.
+- Models from a confirmed free-tier-no-card provider (OpenRouter ":free"
+  models, and as of 2026-10-12 Groq/Gemini -- see
+  metaculus_bot.provider_quota.is_free_tier_provider) are hard-coded to
+  $0/token for *this pre-flight estimate*, regardless of what litellm's
+  static pricing table says, since there's no card on file to ever actually
+  charge. litellm has real published pricing for Groq/Gemini's well-known
+  model families, which is correct data but the wrong number for a
+  card-free key -- see provider_quota.split_real_and_estimated_cost for the
+  equivalent fix on the *actual* post-call cost.
 - Known paid models use litellm.get_model_info() for real per-token pricing.
 - Unknown paid models (not in litellm's table) fall back to a conservative
   non-zero floor (config: UNKNOWN_MODEL_*_COST_PER_TOKEN) rather than $0, so
@@ -20,14 +26,14 @@ from __future__ import annotations
 import logging
 
 from metaculus_bot.config import Config
+from metaculus_bot.provider_quota import is_free_tier_provider
 
 logger = logging.getLogger(__name__)
 
 
 def price_per_token(model: str, cfg: Config) -> tuple[float, float]:
     """Returns (input_cost_per_token, output_cost_per_token)."""
-    bare_model = model.split("/", 1)[-1] if model.startswith("openrouter/") else model
-    if model.endswith(":free") or bare_model.endswith(":free"):
+    if is_free_tier_provider(model):
         return 0.0, 0.0
 
     try:

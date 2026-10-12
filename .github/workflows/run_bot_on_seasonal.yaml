@@ -1,0 +1,72 @@
+name: Forecast on Seasonal Tournament
+
+# Fall 2026 seasonal tournament (fall-futureeval-2026) only -- see
+# run_bot_on_minibench.yaml for MiniBench's separate 15-min schedule.
+# Enabled 2026-10-12 (ENABLE_SEASONAL_TOURNAMENT defaults True in
+# metaculus_bot/config.py).
+#
+# Hourly, not every 15 min: seasonal questions stay open for days/weeks, not
+# MiniBench's ~3h, so a coarser poll is plenty and spends less of the shared
+# provider quota on health checks. That shared quota is why this run
+# deliberately reserves some headroom for MiniBench rather than spending it
+# down to zero -- see metaculus_bot/config.py's minibench_quota_reserve and
+# docs/STAGE_B_PLAN.md "MiniBench quota priority".
+#
+# Concurrency group is explicitly shared with run_bot_on_minibench.yaml (not
+# the default ${{ github.workflow }}, which is per-workflow-name) so the two
+# can never run at the same time and race on the data branch.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5 * * * *" # hourly, offset off the hour
+
+concurrency:
+  group: metaculus-bot-forecast
+  cancel-in-progress: false
+
+# Needed to push the updated forecast DB to the `data` branch.
+permissions:
+  contents: write
+
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: Restore forecast DB from data branch
+        run: bash scripts/restore_data_branch.sh
+      - name: Run bot (seasonal tournament only)
+        run: poetry run python main.py --mode tournament --target seasonal --publish
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          # Optional operational overrides -- set as repo Variables (not
+          # Secrets) if you want to change these without a code change.
+          # Empty/unset falls back to the code default in config.py.
+          MAX_COST_PER_DAY: ${{ vars.MAX_COST_PER_DAY }}
+          MAX_QUESTIONS_PER_DAY_CEILING: ${{ vars.MAX_QUESTIONS_PER_DAY_CEILING }}
+          ENABLE_SEASONAL_TOURNAMENT: ${{ vars.ENABLE_SEASONAL_TOURNAMENT }}
+          MINIBENCH_QUOTA_RESERVE: ${{ vars.MINIBENCH_QUOTA_RESERVE }}
+          REFORECAST_STALENESS_DAYS: ${{ vars.REFORECAST_STALENESS_DAYS }}
+          MAX_REFORECASTS_PER_DAY: ${{ vars.MAX_REFORECASTS_PER_DAY }}
+      - name: Persist forecast DB to data branch
+        if: always()
+        run: bash scripts/persist_data_branch.sh

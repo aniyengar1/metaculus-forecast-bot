@@ -240,3 +240,68 @@ succeeded. Two findings worth flagging:
    not real spend. Low practical risk today (the daily question budget caps
    volume well before $10/day in phantom cost could accumulate), but worth
    knowing the $ figures from Groq/Gemini aren't literal going forward.
+
+## Fixed the phantom-cost issue + enabled seasonal, 2026-10-12
+
+**$ guard fix.** `cost_usd` now always means real spend: `metaculus_bot.
+provider_quota.split_real_and_estimated_cost` zeroes it out whenever every
+model that contributed to a question is a confirmed free-tier-no-card
+provider (`is_free_tier_provider`: groq, gemini, or openrouter with a
+`:free` suffix), regardless of what litellm's real published pricing says.
+litellm's raw number is kept separately as `estimated_cost_usd` (new
+column, migrated in via `db._migrate` since `CREATE TABLE IF NOT EXISTS`
+doesn't retroactively add columns to the already-persisted data-branch DB).
+`budget.price_per_token` got the equivalent fix for the *pre-flight*
+estimate. Added `tests/test_cost_accounting.py` (pytest, new dev dependency)
+proving a Groq+Gemini-only forecast's real cost is always $0 and the
+$/question and $/day guards never block it, even with a deliberately tiny
+cap and litellm reporting a large estimate -- 8 tests, all passing.
+
+**Seasonal tournament enabled.** `ENABLE_SEASONAL_TOURNAMENT` defaults
+`True` now. New `run_bot_on_seasonal.yaml`, hourly (seasonal questions stay
+open for days/weeks, unlike MiniBench's ~3h), sharing an explicit
+`metaculus-bot-forecast` concurrency group with `run_bot_on_minibench.yaml`
+(previously each used the default `${{ github.workflow }}` group, which is
+per-workflow-name and wouldn't have stopped the two from running
+simultaneously and racing on the data branch).
+
+**MiniBench quota priority.** `compute_daily_question_budget` takes a new
+`reserve` parameter; the seasonal run passes `minibench_quota_reserve`
+(default 5) to deliberately leave headroom on the shared Groq/Gemini/
+OpenRouter quota rather than spend it down to zero, since MiniBench polls
+far more often (15 min vs hourly) against much tighter question windows.
+
+**Seasonal re-forecasting.** `_fetch_one_tournament_with_diagnostics` now
+returns `(not_yet_forecasted, already_forecasted)` instead of silently
+dropping the latter. For seasonal specifically,
+`_select_reforecast_candidates` queries our own `forecasts` table (`db.
+get_last_forecast_time`) for anything still open whose last forecast is
+`>reforecast_staleness_days` (default 7) old, oldest-first, capped at
+`max_reforecasts_per_day` (default 5, tracked across the whole day via `db.
+count_reforecasts_today` -- a genuine re-forecast is a forecast with an
+earlier successful one for the same question, today or any prior day).
+MiniBench keeps the simple drop-if-already-forecasted behavior.
+
+This required decoupling from `ForecastBot`'s own `skip_previously_
+forecasted_questions`: that flag's filter runs again inside `forecast_
+questions()` and would have silently re-dropped a question we specifically
+chose to re-forecast (since Metaculus's `already_forecasted` is still
+true). The bot is now always constructed with that flag `False` --
+main.py is the sole authority on which questions to attempt, which it
+already needed to be for the per-tournament already-forecasted handling.
+
+**Tournament-tagged logging.** New `tournament` column (same migration
+mechanism as `estimated_cost_usd`), populated from the mode/target that
+produced each question ("seasonal", "minibench", "test", or "manual" for
+--post-ids). `scripts/weekly_summary.py` now prints an all-combined section
+plus one section per tournament label seen in the window.
+
+**Bug found and fixed while verifying this**: the "closed without being
+forecast" alert check ran *before* the forecast loop, so a question that
+was already closed at the start of a run (e.g. testing against a known-
+closed question via --post-ids) but successfully forecast by that same
+run's loop would still trigger a false-positive alert -- it hadn't been
+marked forecasted yet at check time. Moved the check (now `_check_
+closed_unforecast`) to run after the loop, and to every one of `_run`'s
+early-return points, not just the happy path. Verified via a clean re-run:
+0 alerts where there were previously 3 false positives.

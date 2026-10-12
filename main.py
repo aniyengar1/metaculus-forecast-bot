@@ -5,7 +5,7 @@ import os
 import sys
 from collections import Counter
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import dotenv
 
@@ -37,7 +37,10 @@ from metaculus_bot.budget import BudgetGuard  # noqa: E402
 from metaculus_bot.config import load_config  # noqa: E402
 from metaculus_bot.model_health import select_healthy_models  # noqa: E402
 from metaculus_bot.openrouter_quota import get_free_model_daily_quota  # noqa: E402
-from metaculus_bot.provider_quota import compute_daily_question_budget  # noqa: E402
+from metaculus_bot.provider_quota import (  # noqa: E402
+    compute_daily_question_budget,
+    split_real_and_estimated_cost,
+)
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -126,13 +129,16 @@ def _select_diverse_subset(
 
 async def _fetch_one_tournament_with_diagnostics(
     client: MetaculusClient, tournament_id: int | str, label: str
-) -> list[MetaculusQuestion]:
+) -> tuple[list[MetaculusQuestion], list[MetaculusQuestion]]:
     """Fetches EVERY question in the tournament regardless of status (not
     just open ones), logs a full breakdown (total / by status / open-but-
-    already-forecasted / open-and-still-needs-forecasting), and returns only
-    the open-and-not-yet-forecasted ones. This exists so 'Returning 0
+    already-forecasted / open-and-still-needs-forecasting), and returns
+    (not_yet_forecasted, already_forecasted) -- both restricted to open
+    questions. Callers decide what to do with already-forecasted ones (for
+    MiniBench: nothing, drop them; for seasonal: maybe re-forecast if stale,
+    see _select_reforecast_candidates). This split also means 'Returning 0
     questions' in forecasting_tools' own logs (which only ever reports the
-    post-filter count) can be distinguished from a filter bug: if our own
+    post-filter count) is distinguishable from a filter bug: if our own
     unfiltered count also says 0 (or 0 open), the filter is working
     correctly and there's just nothing to forecast right now."""
     api_filter = ApiFilter(allowed_tournaments=[tournament_id])  # no status/type restriction
@@ -149,32 +155,80 @@ async def _fetch_one_tournament_with_diagnostics(
         f"-- of {len(open_questions)} open: {len(already_forecasted)} already forecasted, "
         f"{len(not_yet_forecasted)} still need forecasting"
     )
-    return not_yet_forecasted
+    return not_yet_forecasted, already_forecasted
+
+
+async def _select_reforecast_candidates(
+    already_forecasted: list[MetaculusQuestion], conn, cfg
+) -> list[MetaculusQuestion]:
+    """Still-open seasonal questions we've already forecast, but whose last
+    forecast is stale enough to redo (new information may have changed
+    things) -- oldest-forecast-first, capped at
+    cfg.max_reforecasts_per_day *for the whole day across all runs*, not
+    per-run."""
+    if not already_forecasted:
+        return []
+    now = datetime.now(timezone.utc)
+    staleness = timedelta(days=cfg.reforecast_staleness_days)
+    stale: list[tuple[datetime, MetaculusQuestion]] = []
+    for q in already_forecasted:
+        last = db.get_last_forecast_time(conn, q.id_of_question)
+        if last and (now - last) > staleness:
+            stale.append((last, q))
+    stale.sort(key=lambda pair: pair[0])  # oldest-forecast-first
+
+    done_today = db.count_reforecasts_today(conn)
+    remaining_cap = max(cfg.max_reforecasts_per_day - done_today, 0)
+    return [q for _, q in stale[:remaining_cap]]
+
+
+def _check_closed_unforecast(conn) -> None:
+    """Checked at every exit point of _run (not just the happy path after a
+    full forecast loop), so a question that closed while deferred across
+    runs is caught even on a run that aborts early for an unrelated reason
+    (e.g. <2 healthy models)."""
+    newly_closed = db.find_newly_closed_unforecast(conn)
+    for question_id, title, url, close_time in newly_closed:
+        msg = f"Question closed without ever being forecast: {url} ({title}) -- closed {close_time}"
+        logger.warning(msg)
+        db.log_alert(conn, msg)
+        print(f"🚨 ALERT: {msg}")
+        db.mark_closed_unforecast_alerted(conn, question_id)
 
 
 async def _fetch_questions(
-    client: MetaculusClient, mode: str, target: str, cfg
+    client: MetaculusClient, mode: str, target: str, cfg, conn
 ) -> list[MetaculusQuestion]:
     if mode == "test_questions":
-        return await _fetch_one_tournament_with_diagnostics(
+        not_yet, _ = await _fetch_one_tournament_with_diagnostics(
             client, "bot-testing-area", "bot-testing-area"
         )
+        return not_yet
 
     questions: list[MetaculusQuestion] = []
     if target in ("both", "seasonal"):
         if cfg.enable_seasonal_tournament:
-            questions += await _fetch_one_tournament_with_diagnostics(
+            not_yet, already = await _fetch_one_tournament_with_diagnostics(
                 client, client.CURRENT_AI_COMPETITION_ID, "seasonal"
             )
+            questions += not_yet
+            reforecast_candidates = await _select_reforecast_candidates(already, conn, cfg)
+            if reforecast_candidates:
+                print(
+                    f"[seasonal] re-forecasting {len(reforecast_candidates)} stale question(s) "
+                    f"(last forecast >{cfg.reforecast_staleness_days}d ago)"
+                )
+            questions += reforecast_candidates
         else:
             print(
                 "  (seasonal tournament skipped: ENABLE_SEASONAL_TOURNAMENT is False "
                 "-- set it once paid credits + stronger models are confirmed)"
             )
     if target in ("both", "minibench"):
-        questions += await _fetch_one_tournament_with_diagnostics(
+        not_yet, _ = await _fetch_one_tournament_with_diagnostics(
             client, client.CURRENT_MINIBENCH_ID, "minibench"
         )
+        questions += not_yet
     return questions
 
 
@@ -193,12 +247,29 @@ async def _run(args: argparse.Namespace) -> int:
         # check when there's nothing to forecast saves ~6-10 OpenRouter
         # requests/run against the free tier's tight daily cap (see
         # docs/STAGE_B_PLAN.md).
+        if args.mode == "test_questions":
+            tournament_label = "test"
+        elif args.post_ids:
+            tournament_label = "manual"
+        else:
+            tournament_label = args.target  # "seasonal" | "minibench" | "both"
+
         client = MetaculusClient()
         if args.post_ids:
             ids = [int(x.strip()) for x in args.post_ids.split(",") if x.strip()]
             questions = [client.get_question_by_post_id(pid) for pid in ids]
+            # The normal fetch path (_fetch_questions) already decides
+            # per-tournament what to do with already-forecasted questions
+            # (drop for MiniBench, maybe re-forecast for seasonal); the
+            # --post-ids bypass doesn't go through that, so apply the simple
+            # (non-reforecasting) rule here as a safety net.
+            if args.mode != "test_questions":
+                for q in questions:
+                    if q.already_forecasted:
+                        db.mark_question_forecasted(conn, q.id_of_question)
+                questions = [q for q in questions if not q.already_forecasted]
         else:
-            questions = await _fetch_questions(client, args.mode, args.target, cfg)
+            questions = await _fetch_questions(client, args.mode, args.target, cfg, conn)
 
         # Log every open question we've ever seen (independent of whether we
         # forecast it *this* run) so we can tell, on a later run, whether one
@@ -214,20 +285,15 @@ async def _run(args: argparse.Namespace) -> int:
                 close_time_iso=q.close_time.isoformat() if q.close_time else None,
             )
 
-        skip_previously_forecasted = args.mode != "test_questions"
-        if skip_previously_forecasted:
-            already_forecasted = [q for q in questions if q.already_forecasted]
-            for q in already_forecasted:
+        # Note in seen_questions that these were already forecast (so the
+        # "closed without being forecast" alert below doesn't
+        # false-positive on them) -- this does NOT filter `questions`:
+        # _fetch_questions already decided per-tournament what to do with
+        # already-forecasted ones (drop for MiniBench, maybe keep a few
+        # stale ones to re-forecast for seasonal).
+        for q in questions:
+            if q.already_forecasted:
                 db.mark_question_forecasted(conn, q.id_of_question)
-            questions = [q for q in questions if not q.already_forecasted]
-
-        newly_closed = db.find_newly_closed_unforecast(conn)
-        for question_id, title, url, close_time in newly_closed:
-            msg = f"Question closed without ever being forecast: {url} ({title}) -- closed {close_time}"
-            logger.warning(msg)
-            db.log_alert(conn, msg)
-            print(f"🚨 ALERT: {msg}")
-            db.mark_closed_unforecast_alerted(conn, question_id)
 
         # Soonest-closing first, so a tight daily/--limit cap drops the
         # questions with the most runway left, not an arbitrary subset.
@@ -244,6 +310,7 @@ async def _run(args: argparse.Namespace) -> int:
 
         if not questions:
             print("Nothing to forecast this run (no new questions).\n")
+            _check_closed_unforecast(conn)
             return 0
 
         print(f"Health-checking model pool ({len(cfg.model_pool)} candidates)...")
@@ -263,6 +330,7 @@ async def _run(args: argparse.Namespace) -> int:
             logger.error(alert_msg)
             db.log_alert(conn, alert_msg)
             print(f"🚨 ALERT: {alert_msg}\n")
+            _check_closed_unforecast(conn)
             return 1
 
         print(f"Health-checking parser pool ({len(cfg.parser_model_pool)} candidates)...")
@@ -288,14 +356,23 @@ async def _run(args: argparse.Namespace) -> int:
         # Real per-provider remaining quota, not a static guess -- see
         # metaculus_bot/provider_quota.py. Computed only now because it needs
         # to know which specific models (incl. the parser) are actually in
-        # play this run.
+        # play this run. MiniBench gets priority on the shared quota (it
+        # polls every 15 min against ~3h question windows; seasonal polls
+        # hourly against multi-day windows) by having the seasonal run
+        # deliberately reserve some headroom rather than spend down to zero.
+        minibench_reserve = cfg.minibench_quota_reserve if tournament_label == "seasonal" else 0
         daily_budget = compute_daily_question_budget(
-            selected_models, parser_model, conn, ceiling=cfg.max_questions_per_day_ceiling
+            selected_models,
+            parser_model,
+            conn,
+            ceiling=cfg.max_questions_per_day_ceiling,
+            reserve=minibench_reserve,
         )
         questions_today = db.get_questions_forecast_today(conn)
         remaining_quota = max(daily_budget - questions_today, 0)
         print(
-            f"Computed daily question budget: {daily_budget} (ceiling {cfg.max_questions_per_day_ceiling}), "
+            f"Computed daily question budget: {daily_budget} (ceiling {cfg.max_questions_per_day_ceiling}"
+            f"{f', minibench reserve {minibench_reserve}' if minibench_reserve else ''}), "
             f"{questions_today} already forecast today -> {remaining_quota} remaining.\n"
         )
         if remaining_quota < len(questions):
@@ -308,6 +385,7 @@ async def _run(args: argparse.Namespace) -> int:
 
         if not questions:
             print("Nothing to forecast this run (daily quota-derived cap reached).\n")
+            _check_closed_unforecast(conn)
             return 0
 
         spent_today = db.get_cost_spent_today(conn)
@@ -335,7 +413,13 @@ async def _run(args: argparse.Namespace) -> int:
             use_research_summary_to_forecast=False,
             enable_summarize_research=False,
             publish_reports_to_metaculus=args.publish,
-            skip_previously_forecasted_questions=skip_previously_forecasted,
+            # False unconditionally: main.py is the sole authority on which
+            # questions to attempt (per-tournament already-forecasted
+            # handling, including deliberate seasonal re-forecasts, all
+            # happens above in _fetch_questions/_select_reforecast_candidates).
+            # The base class's own already_forecasted filter would otherwise
+            # silently re-drop a question we specifically chose to re-forecast.
+            skip_previously_forecasted_questions=False,
             extra_metadata_in_explanation=True,
         )
 
@@ -374,6 +458,8 @@ async def _run(args: argparse.Namespace) -> int:
                     models_used=cfg.models,
                     n_runs=cfg.n_runs,
                     cost_usd=0.0,
+                    estimated_cost_usd=0.0,
+                    tournament=tournament_label,
                     status="error",
                     error_message=f"{type(report).__name__}: {report}",
                 )
@@ -381,10 +467,19 @@ async def _run(args: argparse.Namespace) -> int:
 
             reports.append(report)
             successful_count += 1
-            actual_cost = report.price_estimate or 0.0
-            budget_guard.record_actual(actual_cost)
             key = question.id_of_post or question.id_of_question or id(question)
             debug = bot.debug_log.pop(key, {})
+
+            estimated_cost = report.price_estimate or 0.0
+            models_used_this_question = {
+                o["model"] for o in debug.get("raw_model_outputs", []) if not o.get("error")
+            }
+            models_used_this_question.add(cfg.parser_model)
+            real_cost, estimated_cost = split_real_and_estimated_cost(
+                models_used_this_question, estimated_cost
+            )
+            budget_guard.record_actual(real_cost)
+
             db.log_forecast(
                 conn,
                 question_id=question.id_of_question,
@@ -400,7 +495,9 @@ async def _run(args: argparse.Namespace) -> int:
                 dry_run=not args.publish,
                 models_used=cfg.models,
                 n_runs=cfg.n_runs,
-                cost_usd=actual_cost,
+                cost_usd=real_cost,
+                estimated_cost_usd=estimated_cost,
+                tournament=tournament_label,
                 status="ok",
             )
             if question.id_of_question is not None:
@@ -422,6 +519,14 @@ async def _run(args: argparse.Namespace) -> int:
             logger.error(alert_msg)
             db.log_alert(conn, alert_msg)
             print(f"🚨 ALERT: {alert_msg}\n")
+
+        # Checked last, not before the forecast loop above: a question can
+        # be already-closed-but-not-yet-forecast at the *start* of this very
+        # run and still get successfully forecast by the loop above (e.g.
+        # --post-ids against a closed question, or a late health-check-pool
+        # recovery) -- checking before the loop produced false positives on
+        # exactly those questions.
+        _check_closed_unforecast(conn)
 
     return 0
 

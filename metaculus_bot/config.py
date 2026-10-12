@@ -133,10 +133,25 @@ class Config:
     min_quota_reserve_for_scheduled_run: int = 15
     enforce_rate_limit_guard: bool = True
 
-    # Seasonal tournament (fall-futureeval-2026) stays off until paid LLM
-    # credits + stronger models are confirmed -- weak free-tier forecasts
-    # there would hurt the seasonal score. MiniBench runs regardless.
-    enable_seasonal_tournament: bool = False
+    # Seasonal tournament (fall-futureeval-2026). Enabled 2026-10-12 on its
+    # own hourly schedule (run_bot_on_seasonal.yaml) -- separate from
+    # MiniBench's 15-min schedule since seasonal questions stay open for
+    # days/weeks, not 3 hours. Both workflows share one concurrency group so
+    # they never race on the data branch.
+    enable_seasonal_tournament: bool = True
+    # When computing the seasonal run's daily question budget, subtract this
+    # many questions' worth of quota as headroom deliberately left for
+    # MiniBench (which polls far more often and has a much tighter per-
+    # question window to work with) -- see docs/STAGE_B_PLAN.md
+    # "MiniBench quota priority".
+    minibench_quota_reserve: int = 5
+
+    # Seasonal re-forecasting: if a seasonal question we already forecast is
+    # still open and our last forecast is older than this many days,
+    # re-forecast it (new information may have changed things), capped at
+    # this many re-forecasts per day so it can't crowd out fresh questions.
+    reforecast_staleness_days: int = 7
+    max_reforecasts_per_day: int = 5
 
     # Calibration (applied to final binary probability only)
     calibration_k: float = 1.0
@@ -171,7 +186,10 @@ def load_config() -> Config:
         max_questions_per_day_ceiling=_get_int("MAX_QUESTIONS_PER_DAY_CEILING", 20),
         min_quota_reserve_for_scheduled_run=_get_int("MIN_QUOTA_RESERVE_FOR_SCHEDULED_RUN", 15),
         enforce_rate_limit_guard=_get_bool("ENFORCE_RATE_LIMIT_GUARD", True),
-        enable_seasonal_tournament=_get_bool("ENABLE_SEASONAL_TOURNAMENT", False),
+        enable_seasonal_tournament=_get_bool("ENABLE_SEASONAL_TOURNAMENT", True),
+        minibench_quota_reserve=_get_int("MINIBENCH_QUOTA_RESERVE", 5),
+        reforecast_staleness_days=_get_int("REFORECAST_STALENESS_DAYS", 7),
+        max_reforecasts_per_day=_get_int("MAX_REFORECASTS_PER_DAY", 5),
         calibration_k=_get_float("CALIBRATION_K", 1.0),
         calibration_clip_min=_get_float("CALIBRATION_CLIP_MIN", 0.02),
         calibration_clip_max=_get_float("CALIBRATION_CLIP_MAX", 0.98),

@@ -1,16 +1,18 @@
 name: Forecast on MiniBench
 
-# MiniBench only -- the seasonal tournament (fall-futureeval-2026) stays off
-# via the ENABLE_SEASONAL_TOURNAMENT config flag (defaults False in
-# metaculus_bot/config.py) until paid LLM credits + stronger models are
-# confirmed. See docs/STAGE_B_PLAN.md for the per-provider quota math behind
-# the daily question budget.
+# MiniBench only -- see run_bot_on_seasonal.yaml for the Fall seasonal
+# tournament's separate hourly schedule. See docs/STAGE_B_PLAN.md for the
+# per-provider quota math behind the daily question budget and why
+# MiniBench gets priority on the quota the two share.
 #
 # Every 15 min, not every 2h: MiniBench questions are only open ~3h each
 # (confirmed 2026-10-11 diagnosis), so a coarser poll risks missing some
-# entirely. The concurrency group below (already in place since Stage B)
-# means a run that's still going when the next trigger fires queues instead
-# of overlapping -- runs never race each other on the data branch.
+# entirely.
+#
+# Concurrency group is explicitly shared with run_bot_on_seasonal.yaml (not
+# the default ${{ github.workflow }}, which is per-workflow-name) so the two
+# can never run at the same time and race on the data branch -- whichever
+# triggers second queues instead of overlapping.
 
 on:
   workflow_dispatch:
@@ -18,7 +20,7 @@ on:
     - cron: "*/15 * * * *" # every 15 minutes
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: metaculus-bot-forecast
   cancel-in-progress: false
 
 # Needed to push the updated forecast DB to the `data` branch.
@@ -59,7 +61,6 @@ jobs:
           # Empty/unset falls back to the code default in config.py.
           MAX_COST_PER_DAY: ${{ vars.MAX_COST_PER_DAY }}
           MAX_QUESTIONS_PER_DAY_CEILING: ${{ vars.MAX_QUESTIONS_PER_DAY_CEILING }}
-          ENABLE_SEASONAL_TOURNAMENT: ${{ vars.ENABLE_SEASONAL_TOURNAMENT }}
       - name: Persist forecast DB to data branch
         if: always()
         run: bash scripts/persist_data_branch.sh
