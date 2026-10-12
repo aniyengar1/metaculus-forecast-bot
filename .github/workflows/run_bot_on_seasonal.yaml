@@ -1,16 +1,23 @@
 name: Forecast on Seasonal Tournament
 
 # Fall 2026 seasonal tournament (fall-futureeval-2026) only -- see
-# run_bot_on_minibench.yaml for MiniBench's separate 15-min schedule.
-# Enabled 2026-10-12 (ENABLE_SEASONAL_TOURNAMENT defaults True in
-# metaculus_bot/config.py).
+# run_bot_on_minibench.yaml for MiniBench's schedule. Enabled 2026-10-12
+# (ENABLE_SEASONAL_TOURNAMENT defaults True in metaculus_bot/config.py).
 #
-# Hourly, not every 15 min: seasonal questions stay open for days/weeks, not
-# MiniBench's ~3h, so a coarser poll is plenty and spends less of the shared
-# provider quota on health checks. That shared quota is why this run
-# deliberately reserves some headroom for MiniBench rather than spending it
-# down to zero -- see metaculus_bot/config.py's minibench_quota_reserve and
-# docs/STAGE_B_PLAN.md "MiniBench quota priority".
+# Every 15 min, same as MiniBench -- corrected 2026-10-12 after pulling all
+# 27 real fall-futureeval-2026 questions directly from the API: every single
+# one (26 real + 1 resolved pre-season practice question) has an exactly
+# 3-hour open window, same as MiniBench, not the "days/weeks" originally
+# assumed. Release cadence is bursty (0-4 questions/day, one 4-day gap seen
+# so far) but each individual question is just as short-lived, so hourly
+# polling risked missing several entirely. See docs/STAGE_B_PLAN.md
+# "Seasonal cadence correction" for the full breakdown.
+#
+# Offset by 7 min from MiniBench's :00/:15/:30/:45 triggers (this fires at
+# :07/:22/:37/:52) so the two interleave on the shared concurrency group
+# below instead of colliding on literally every trigger -- each still gets
+# checked roughly every ~7-8 min in practice, just never at the exact same
+# moment as the other.
 #
 # Concurrency group is explicitly shared with run_bot_on_minibench.yaml (not
 # the default ${{ github.workflow }}, which is per-workflow-name) so the two
@@ -19,7 +26,7 @@ name: Forecast on Seasonal Tournament
 on:
   workflow_dispatch:
   schedule:
-    - cron: "5 * * * *" # hourly, offset off the hour
+    - cron: "7,22,37,52 * * * *"
 
 concurrency:
   group: metaculus-bot-forecast

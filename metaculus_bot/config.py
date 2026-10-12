@@ -133,23 +133,32 @@ class Config:
     min_quota_reserve_for_scheduled_run: int = 15
     enforce_rate_limit_guard: bool = True
 
-    # Seasonal tournament (fall-futureeval-2026). Enabled 2026-10-12 on its
-    # own hourly schedule (run_bot_on_seasonal.yaml) -- separate from
-    # MiniBench's 15-min schedule since seasonal questions stay open for
-    # days/weeks, not 3 hours. Both workflows share one concurrency group so
-    # they never race on the data branch.
+    # Seasonal tournament (fall-futureeval-2026). Enabled 2026-10-12, on its
+    # own 15-min schedule (run_bot_on_seasonal.yaml, offset from MiniBench's
+    # so they interleave rather than collide on every trigger) -- all 26 real
+    # questions pulled from the API on 2026-10-12 turned out to have the same
+    # exact 3-hour open window as MiniBench, not the "days/weeks" originally
+    # assumed; see docs/STAGE_B_PLAN.md "Seasonal cadence correction". Both
+    # workflows share one concurrency group so they never race on the data
+    # branch.
     enable_seasonal_tournament: bool = True
     # When computing the seasonal run's daily question budget, subtract this
     # many questions' worth of quota as headroom deliberately left for
-    # MiniBench (which polls far more often and has a much tighter per-
-    # question window to work with) -- see docs/STAGE_B_PLAN.md
-    # "MiniBench quota priority".
+    # MiniBench -- a user-specified priority (MiniBench wins when the two
+    # compete for the same Groq/Gemini/OpenRouter quota), not a cadence
+    # argument now that both poll every ~15 min.
     minibench_quota_reserve: int = 5
 
     # Seasonal re-forecasting: if a seasonal question we already forecast is
     # still open and our last forecast is older than this many days,
     # re-forecast it (new information may have changed things), capped at
     # this many re-forecasts per day so it can't crowd out fresh questions.
+    # In practice this rarely/never fires given the 3h windows above (a
+    # question is closed long before it could turn 7-days-stale while still
+    # open) -- kept anyway since it costs nothing when it doesn't apply (a
+    # local DB query against already-fetched questions, no extra Metaculus
+    # API calls and zero LLM calls unless a genuine candidate exists) and
+    # protects against the tournament's format changing later in the season.
     reforecast_staleness_days: int = 7
     max_reforecasts_per_day: int = 5
 

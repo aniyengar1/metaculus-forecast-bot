@@ -305,3 +305,43 @@ marked forecasted yet at check time. Moved the check (now `_check_
 closed_unforecast`) to run after the loop, and to every one of `_run`'s
 early-return points, not just the happy path. Verified via a clean re-run:
 0 alerts where there were previously 3 false positives.
+
+## Seasonal cadence correction, 2026-10-12
+
+After the first live seasonal forecast landed, pulled all 27
+`fall-futureeval-2026` posts directly from the API, unfiltered (one of the
+28 posts returned is a non-question announcement notebook, excluded). Full
+breakdown:
+
+- **1 pre-season practice question** (`[PRACTICE] ...`): open Sep 6 → Sep
+  28, a 528-hour (~22 day) window, already resolved. Not representative of
+  the tournament proper.
+- **26 real questions**, every single one Sep 28 → Oct 12: **exactly a
+  3.0-hour open window, zero exceptions** -- identical to MiniBench's
+  format, not the "days/weeks" originally assumed when the seasonal
+  schedule was built hourly. 25 closed, 1 open (the gas-price question from
+  the first live run).
+- **Cadence**: 1.82 questions/day average over the 14.3-day span so far, but
+  bursty -- 0-4/day, including a 4-day gap (Oct 2-4) and a 4-per-day stretch
+  (Oct 10). Median gap between consecutive opens: 10.0h; max: 99.3h.
+
+**Fix**: `run_bot_on_seasonal.yaml` moved from hourly to every 15 min, same
+as MiniBench, since a 3h window needs frequent polling to reliably catch.
+Offset by 7 min from MiniBench's `:00/:15/:30/:45` (`:07/:22/:37/:52`) so
+the two interleave on their shared concurrency group rather than colliding
+on literally every trigger.
+
+**Re-forecasting, confirmed cheap even though it's now mostly moot**: with
+3h windows, a question is closed long before any realistic staleness
+threshold (default 7 days) could apply while it's still open -- so
+`_select_reforecast_candidates` will almost always see an empty candidate
+list for this tournament's current format. Confirmed it costs nothing in
+that empty case regardless: it operates on `already_forecasted`, which is
+already fetched as part of the single per-tournament API pull (no extra
+Metaculus request), and the only other work is two local SQLite queries
+(`get_last_forecast_time`, `count_reforecasts_today`) -- no LLM calls happen
+unless a genuine stale-and-still-open candidate actually exists. Kept as-is
+rather than removed: cheap insurance if the tournament's format changes to
+include longer-lived questions later in the season (the tournament runs
+through Jan 6, 2027, and nothing guarantees every batch looks like the
+first ~2 weeks).
