@@ -1,10 +1,12 @@
 name: Weekly Summary
 
 # Prints a summary of the last 7 days' bot activity (questions forecast, $
-# spent, AskNews usage, alerts, and resolved-question scores once those
-# exist) to this workflow's job log, read from the persisted forecast DB.
-# No API calls, no spend -- purely reads data/forecasts.db from the `data`
-# branch.
+# spent, AskNews usage, alerts) to this workflow's job log, read from the
+# persisted forecast DB on the `data` branch. No spend either way, but one
+# exception to "no API calls": the performance report section
+# (scripts/performance_report.py) makes read-only GETs against the
+# Metaculus API to pull official peer/baseline scores for any of our
+# questions that have since resolved -- hence METACULUS_TOKEN below.
 
 on:
   workflow_dispatch:
@@ -34,4 +36,6 @@ jobs:
       - name: Restore forecast DB from data branch
         run: bash scripts/restore_data_branch.sh
       - name: Print weekly summary
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
         run: poetry run python scripts/weekly_summary.py --days 7

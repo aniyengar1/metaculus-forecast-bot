@@ -376,3 +376,62 @@ Checked both the `forecasting_tools` source and the live API:
   bypasses `_create_unified_explanation`.
 
 Covered by `tests/test_comment_safety.py`.
+
+## Performance report, 2026-10-13
+
+`scripts/performance_report.py`, run as part of the weekly summary
+(`scripts/weekly_summary.py`), pulls Metaculus's own score for every
+question we've forecast that has since resolved and combines it with our
+local log. Read-only: every call is a GET against `/api/posts/{id}/with_cp=true`,
+never a submission.
+
+**Finding the score schema was the hard part** -- the REST API has no
+published docs for it, and this environment doesn't yet have any resolved
+*and scored* question of ours to inspect empirically (checked: of our own
+forecasted test/tournament questions, none are `resolved` yet as of this
+writing; general site-wide `resolved` questions sampled also had null
+`resolution`/`score_data`, so this Metaculus instance's scoring batch job
+plausibly hasn't run yet either). Found the real shape instead via
+Metaculus's open-source webapp repo (`Metaculus/metaculus` on GitHub),
+`docs/openapi.yml`: a resolved+scored question's
+`question.my_forecasts.score_data` (our own score) and
+`question.aggregations.<method>.score_data` (community's) both look like:
+
+```
+{"peer_score": 51.67, "coverage": 0.998, "baseline_score": 35.15,
+ "spot_peer_score": 57.56, "peer_archived_score": ..., ...}
+```
+
+MiniBench and Market Pulse score with `spot_peer_score`/`spot_baseline_score`;
+the seasonal tournament's `score_type` is non-spot `peer`/`baseline`. The
+report prefers the non-spot key and falls back to the spot one, so either
+tournament type yields one number.
+
+**What it reports**:
+- Avg peer/baseline score overall, by tournament, by question type -- only
+  over questions we actually *submitted* (`dry_run=0`); Metaculus never
+  scores a forecast that was never sent.
+- Per-model Brier for binary questions: each model's raw, pre-ensemble
+  probability vs. the actual "yes"/"no" outcome, parsed from
+  `raw_model_outputs` in our own log.
+- Raw ensemble Brier vs. post-calibration Brier (binary only -- calibration
+  is a binary-only hook, see `metaculus_bot/calibration.py`), plus the
+  average gap between our submitted probability and the community
+  prediction *at the time we forecast* (from the CP history timeseries in
+  `aggregations.<method>.history`, matched to our `run_timestamp`).
+- A 10-bin calibration table (predicted probability vs. empirical resolution
+  rate), binary only, including dry-run forecasts (that part only needs our
+  predicted probability + the eventual outcome, not an official submission).
+
+**A real local-DB quirk found and worked around**: `aggregate_value` and
+`post_calibration_value` are stored *double JSON-encoded* -- `bot.py`'s
+`_record_debug` already does `str(value)` before handing it to
+`db.log_forecast`, which then does its own `json.dumps(..., default=str)` on
+top, so the column literally contains `"0.42"` with the quote characters
+included. `performance_report._parse_logged_value` does `json.loads()` once
+to undo that before `float()`-parsing.
+
+Covered by `tests/test_performance_report.py` (score_data extraction + spot
+fallback, CP-history lookup, Brier/calibration math, and an end-to-end
+`generate_report()` test with `fetch_question_json` monkeypatched -- no real
+network call in tests).

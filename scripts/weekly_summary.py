@@ -1,9 +1,9 @@
 """
-Weekly summary of bot activity, read entirely from our own SQLite log
-(data/forecasts.db) -- no Metaculus or OpenRouter API calls. Covers:
-questions forecast, $ spent, AskNews calls used this month, and (once the
-`resolutions` table has rows -- nothing populates it yet, that's a later
-step) Brier/log score.
+Weekly summary of bot activity. Questions forecast, $ spent, and AskNews
+usage come entirely from our own SQLite log (data/forecasts.db) -- no API
+calls. The performance report appended at the end (scripts/performance_report.py)
+is the one exception: it makes read-only GETs against the Metaculus API to
+pull official peer/baseline scores for questions that have since resolved.
 
 Usage:
     poetry run python scripts/weekly_summary.py [--db-path data/forecasts.db] [--days 7]
@@ -11,14 +11,20 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import dotenv
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from metaculus_bot import db  # noqa: E402
+
+import performance_report  # noqa: E402
 
 
 def _window_start(days: int) -> str:
@@ -103,30 +109,13 @@ def summarize(conn: sqlite3.Connection, days: int) -> str:
     else:
         lines.append("\nNo alerts this window.")
 
-    resolved = conn.execute(
-        "SELECT r.brier_score, r.log_score FROM resolutions r "
-        "JOIN forecasts f ON f.question_id = r.question_id "
-        "WHERE r.resolved_at >= ?",
-        (since,),
-    ).fetchall()
-    if resolved:
-        briers = [b for b, _ in resolved if b is not None]
-        logs = [l for _, l in resolved if l is not None]
-        lines.append(f"\nResolved questions this window: {len(resolved)}")
-        if briers:
-            lines.append(f"  Average Brier score: {sum(briers)/len(briers):.4f}")
-        if logs:
-            lines.append(f"  Average log score:   {sum(logs)/len(logs):.4f}")
-    else:
-        lines.append(
-            "\nNo resolved questions yet to score (the `resolutions` table isn't "
-            "populated by anything yet -- that's a later calibration-analysis step)."
-        )
+    lines.append("\n" + performance_report.generate_report(conn, os.getenv("METACULUS_TOKEN")))
 
     return "\n".join(lines)
 
 
 if __name__ == "__main__":
+    dotenv.load_dotenv()
     parser = argparse.ArgumentParser(description="Print a weekly bot activity summary")
     parser.add_argument("--db-path", type=str, default="data/forecasts.db")
     parser.add_argument("--days", type=int, default=7)
