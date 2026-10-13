@@ -345,3 +345,34 @@ rather than removed: cheap insurance if the tournament's format changes to
 include longer-lived questions later in the season (the tournament runs
 through Jan 6, 2027, and nothing guarantees every batch looks like the
 first ~2 weeks).
+
+## Comment privacy and length, 2026-10-13
+
+Metaculus treats long *public* bot comments as spam, with penalties up to
+account deactivation; private comments are tolerated "within reason."
+Checked both the `forecasting_tools` source and the live API:
+
+- **Already private**: `MetaculusClient.post_question_comment` defaults to
+  `is_private=True`, and none of the three report types'
+  `publish_report_to_metaculus()` override it. Confirmed empirically against
+  all 8 comments posted so far (posts 45960, 45961, 43324, 43325 x2, 43326,
+  43327, 45517): 8/8 private, 0 public. Nothing to clean up.
+- **But far too long**: those 8 comments ran 6,293-11,506 characters each --
+  the base class's default `_create_unified_explanation` dumps the full
+  research text and every model's complete reasoning. Long either way isn't
+  "within reason," privacy aside.
+
+**Fix**, in `metaculus_bot/bot.py`:
+- `FutureEvalBot._create_unified_explanation` overrides the base class to
+  build a short comment instead: final prediction + up to 5 per-model
+  bullets (via the new `_short_value_repr` helper, which renders a
+  `NumericDistribution`'s median instead of its full ~thousands-of-chars
+  repr) + cost/time. Hard-capped at `_MAX_COMMENT_CHARS` (1500).
+- `_force_private_and_cap_length` instance-patches
+  `self.metaculus_client.post_question_comment` (patched on the instance,
+  not the class, so it can't affect any other code sharing the SDK) to
+  force `is_private=True` and re-apply the length cap at the actual
+  API-call layer too -- belt-and-suspenders in case any future caller
+  bypasses `_create_unified_explanation`.
+
+Covered by `tests/test_comment_safety.py`.

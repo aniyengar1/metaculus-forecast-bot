@@ -37,8 +37,10 @@ from forecasting_tools import (
     DateQuestion,
     ForecastBot,
     GeneralLlm,
+    MetaculusClient,
     MetaculusQuestion,
     MultipleChoiceQuestion,
+    NumericDistribution,
     NumericQuestion,
     Percentile,
     PredictedOptionList,
@@ -46,6 +48,7 @@ from forecasting_tools import (
     clean_indents,
     structure_output,
 )
+from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.data_models.numeric_report import NumericReport
 
 from metaculus_bot import db, research
@@ -73,6 +76,67 @@ logger = logging.getLogger(__name__)
 # several concurrent requests at once; spacing requests out a little cuts
 # collision odds substantially without meaningfully slowing a question down.
 _STAGGER_SECONDS = 1.5
+
+# Metaculus treats long PUBLIC bot comments as spam (penalties up to account
+# deactivation); private comments are tolerated "within reason". Our comments
+# are private by forecasting_tools' own default (MetaculusClient.
+# post_question_comment(..., is_private: bool = True), confirmed empirically
+# 2026-10-13: 8/8 of our posted comments are_private=True, 0 public) -- but
+# we still (a) force it explicitly rather than depend on an upstream default
+# that could change, and (b) keep comments genuinely short regardless of
+# privacy, since 10k+ character research dumps aren't "within reason" either
+# way. See docs/STAGE_B_PLAN.md "Comment privacy and length".
+_MAX_COMMENT_CHARS = 1500
+
+
+def _short_value_repr(value: Any) -> str:
+    """A short (<=~80 char) human-readable summary of one model's parsed
+    forecast, for the per-model bullet list -- not the full object (a
+    NumericDistribution's repr alone is thousands of characters, the 201
+    declared_percentiles)."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value * 100:.1f}%"
+    if isinstance(value, PredictedOptionList):
+        parts = [f"{o.option_name}={o.probability * 100:.0f}%" for o in value.predicted_options]
+        return ", ".join(parts)[:80]
+    if isinstance(value, NumericDistribution):
+        try:
+            median = value.get_percentiles_at_target_heights([0.5])[0].value
+            if value.is_date:
+                median_str = datetime.fromtimestamp(median).strftime("%Y-%m-%d")
+            else:
+                median_str = f"{median:.3g}"
+            return f"median≈{median_str}"
+        except Exception:
+            return "(distribution)"
+    return str(value)[:80]
+
+
+def _force_private_and_cap_length(client: MetaculusClient) -> None:
+    """Monkey-patches this MetaculusClient *instance's*
+    post_question_comment (not the class -- doesn't affect any other code
+    using the SDK) so every comment we post is explicitly forced private and
+    length-capped, regardless of what any caller passes. forecasting_tools'
+    own publish_report_to_metaculus() already defaults to private and never
+    caps length; this makes both explicit rather than relying on an upstream
+    default, and is belt-and-suspenders on top of
+    FutureEvalBot._create_unified_explanation already building a short
+    comment in the first place."""
+    original = client.post_question_comment
+
+    def forced_private_capped(
+        post_id: int,
+        comment_text: str,
+        is_private: bool = True,  # noqa: ARG001 -- intentionally ignored, always forced True
+        included_forecast: bool = True,
+    ) -> None:
+        if len(comment_text) > _MAX_COMMENT_CHARS:
+            comment_text = comment_text[: _MAX_COMMENT_CHARS - 20].rstrip() + "\n[truncated]"
+        return original(post_id, comment_text, is_private=True, included_forecast=included_forecast)
+
+    client.post_question_comment = forced_private_capped
 
 
 class BudgetSkipped(Exception):
@@ -118,6 +182,7 @@ class FutureEvalBot(ForecastBot):
         self.models = cfg.models
         self.n_runs = cfg.n_runs
         self.debug_log: dict[Any, dict[str, Any]] = {}
+        _force_private_and_cap_length(self.metaculus_client)
 
     def _model_for_run(self, i: int) -> str:
         return self.models[i % len(self.models)]
@@ -646,6 +711,16 @@ class FutureEvalBot(ForecastBot):
         ]
         entry["aggregate_value"] = str(aggregate_value)
         entry["post_calibration_value"] = str(post_calibration_value)
+        # Built from the *typed* results here (not the stringified
+        # raw_model_outputs above) since a NumericDistribution's full repr is
+        # thousands of characters -- this is what the short Metaculus comment
+        # actually uses, see _create_unified_explanation below.
+        entry["short_bullets"] = [
+            f"{r.model}: failed ({(r.error or '').split(':')[0]})"
+            if r.error
+            else f"{r.model}: {_short_value_repr(r.value)}"
+            for r in results
+        ]
 
     @staticmethod
     def _combine_reasoning(results: list[ModelRunResult]) -> str:
@@ -656,3 +731,45 @@ class FutureEvalBot(ForecastBot):
             else:
                 parts.append(f"### Model: {r.model} (run {r.run_index})\n{r.raw_text}")
         return "\n\n".join(parts)
+
+    ##################################### METACULUS COMMENT #####################################
+
+    def _create_unified_explanation(
+        self,
+        question: MetaculusQuestion,
+        research_prediction_collections: list,
+        aggregated_prediction: Any,
+        final_cost: float,
+        time_spent_in_minutes: float,
+    ) -> str:
+        """Overrides the base class's default (which dumps the full research
+        text and every model's complete reasoning -- 6-11k characters in our
+        own posted comments, checked 2026-10-13). Final prediction + a
+        per-model bullet (capped at 5) is enough for the private 'why' a
+        human would actually want to check, without the length that gets
+        long *public* comments treated as spam -- and ours are private, but
+        long either way isn't "within reason". Length is also hard-capped
+        here (belt-and-suspenders with _force_private_and_cap_length, which
+        catches this at the actual API-call layer too)."""
+        report_type = DataOrganizer.get_report_type_for_question_type(type(question))
+        readable_prediction = report_type.make_readable_prediction(aggregated_prediction)
+
+        key = _question_key(question)
+        debug = self.debug_log.get(key, {})
+        bullets = debug.get("short_bullets", [])[:5]
+        bullet_text = "\n".join(f"- {b}" for b in bullets) if bullets else "- (no per-model detail available)"
+
+        comment = clean_indents(
+            f"""
+            # Summary
+            Final prediction: {readable_prediction}
+
+            Per-model ({len(bullets)}):
+            {bullet_text}
+
+            Cost: ${final_cost:.4f} | {time_spent_in_minutes:.1f} min
+            """
+        ).strip()  # clean_indents doesn't strip the leading/trailing newline from the triple-quoted string
+        if len(comment) > _MAX_COMMENT_CHARS:
+            comment = comment[: _MAX_COMMENT_CHARS - 20].rstrip() + "\n[truncated]"
+        return comment
