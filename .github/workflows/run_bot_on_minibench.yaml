@@ -30,6 +30,14 @@ permissions:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest
+    # Bounds the worst case if a run ever hangs instead of erroring (no
+    # provider timeout firing, etc.) -- without this the default 360-min
+    # GitHub timeout lets one stuck run hold the shared concurrency slot for
+    # hours while the backup poller (kalshi-bot-vm, every 10 min) keeps
+    # queuing more behind it. Typical real runs are 45-100s; 15 min is
+    # generous headroom that still caps the queue depth instead of letting
+    # it grow unbounded. See docs/STAGE_B_PLAN.md "Backup poller".
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

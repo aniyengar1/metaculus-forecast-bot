@@ -2,11 +2,13 @@ name: Weekly Summary
 
 # Prints a summary of the last 7 days' bot activity (questions forecast, $
 # spent, AskNews usage, alerts) to this workflow's job log, read from the
-# persisted forecast DB on the `data` branch. No spend either way, but one
-# exception to "no API calls": the performance report section
+# persisted forecast DB on the `data` branch. No spend either way, but two
+# exceptions to "no API calls": the performance report section
 # (scripts/performance_report.py) makes read-only GETs against the
-# Metaculus API to pull official peer/baseline scores for any of our
-# questions that have since resolved -- hence METACULUS_TOKEN below.
+# Metaculus API for resolved questions' official scores (METACULUS_TOKEN),
+# and the backup-poller health section (scripts/dispatch_health.py) reads
+# this repo's own Actions run history via the built-in GITHUB_TOKEN --
+# hence `actions: read` below. See docs/STAGE_B_PLAN.md "Backup poller".
 
 on:
   workflow_dispatch:
@@ -15,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   summary:
@@ -38,4 +41,6 @@ jobs:
       - name: Print weekly summary
         env:
           METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          METACULUS_DISPATCH_PAT_EXPIRES: ${{ vars.METACULUS_DISPATCH_PAT_EXPIRES }}
         run: poetry run python scripts/weekly_summary.py --days 7

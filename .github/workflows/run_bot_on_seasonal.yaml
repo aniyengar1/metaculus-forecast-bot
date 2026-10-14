@@ -39,6 +39,9 @@ permissions:
 jobs:
   forecast_job:
     runs-on: ubuntu-latest
+    # See run_bot_on_minibench.yaml -- same reasoning, same shared
+    # concurrency group and backup poller.
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
