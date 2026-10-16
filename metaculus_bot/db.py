@@ -345,6 +345,33 @@ def get_last_forecast_time(conn: sqlite3.Connection, question_id: int) -> dateti
     return datetime.fromisoformat(row[0])
 
 
+def latest_forecasts_per_question(conn: sqlite3.Connection, *, dry_run: bool | None) -> list[sqlite3.Row]:
+    """One row per question_id -- whichever 'ok' forecast is most recent (a
+    re-forecast supersedes an earlier one for analysis purposes). Shared by
+    scripts/performance_report.py and scripts/upcoming_resolutions.py.
+
+    dry_run=False restricts to rows that were actually submitted to
+    Metaculus (the only ones that can have an official score, or a
+    resolve-date worth tracking as "our" prediction); dry_run=None
+    considers both, for local-only metrics (Brier/calibration) that don't
+    need an official submission, just our own predicted probability and the
+    eventual outcome."""
+    conn.row_factory = sqlite3.Row
+    outer_clause = "" if dry_run is None else "AND f.dry_run = 0"
+    inner_clause = "" if dry_run is None else "AND f2.dry_run = 0"
+    rows = conn.execute(
+        f"""
+        SELECT f.* FROM forecasts f
+        WHERE f.status = 'ok' AND f.question_id IS NOT NULL {outer_clause}
+          AND f.run_timestamp = (
+              SELECT MAX(f2.run_timestamp) FROM forecasts f2
+              WHERE f2.question_id = f.question_id AND f2.status = 'ok' {inner_clause}
+          )
+        """
+    ).fetchall()
+    return rows
+
+
 def count_reforecasts_today(conn: sqlite3.Connection) -> int:
     """How many of today's successful forecasts are a *re*-forecast (i.e.
     this question already had an earlier successful forecast, today or any

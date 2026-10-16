@@ -25,6 +25,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,48 +43,36 @@ _POSTS_URL = "https://www.metaculus.com/api/posts/{post_id}/"
 _TIMEOUT_SECONDS = 15
 _BINARY_QUESTION_TYPE = "BinaryQuestion"
 _CALIBRATION_BINS = 10
-
-
-def _latest_rows_per_question(conn: sqlite3.Connection, *, dry_run: bool | None) -> list[sqlite3.Row]:
-    """One row per question_id -- whichever 'ok' forecast is most recent (a
-    re-forecast supersedes an earlier one for analysis purposes).
-
-    dry_run=False restricts to rows that were actually submitted to
-    Metaculus (the only ones that can have an official score); dry_run=None
-    considers both, for local-only metrics (Brier/calibration) that don't
-    need an official submission, just our own predicted probability and the
-    eventual outcome."""
-    conn.row_factory = sqlite3.Row
-    outer_clause = "" if dry_run is None else "AND f.dry_run = 0"
-    inner_clause = "" if dry_run is None else "AND f2.dry_run = 0"
-    rows = conn.execute(
-        f"""
-        SELECT f.* FROM forecasts f
-        WHERE f.status = 'ok' AND f.question_id IS NOT NULL {outer_clause}
-          AND f.run_timestamp = (
-              SELECT MAX(f2.run_timestamp) FROM forecasts f2
-              WHERE f2.question_id = f.question_id AND f2.status = 'ok' {inner_clause}
-          )
-        """
-    ).fetchall()
-    return rows
+_MIN_REQUEST_INTERVAL_SECONDS = 0.5
+_RETRY_AFTER_429_SECONDS = 5
 
 
 def fetch_question_json(post_id: int, token: str) -> dict[str, Any] | None:
     """GET-only. Returns None (and logs a warning) on any failure so one bad
-    question can't take down the whole report."""
-    try:
-        response = requests.get(
-            _POSTS_URL.format(post_id=post_id),
-            headers={"Authorization": f"Token {token}", "Accept-Language": "en"},
-            params={"with_cp": "true"},
-            timeout=_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logger.warning(f"Could not fetch question data for post {post_id}: {e}")
-        return None
+    question can't take down the whole report. A small fixed delay before
+    every call plus one retry on 429 -- confirmed 2026-10-16 that calling
+    this back-to-back across ~19 questions (shared by
+    scripts/upcoming_resolutions.py too, so a weekly run can easily exceed
+    that) reliably triggers Metaculus's rate limit and silently drops data
+    otherwise (a 429 is caught below and just skips the question)."""
+    time.sleep(_MIN_REQUEST_INTERVAL_SECONDS)
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                _POSTS_URL.format(post_id=post_id),
+                headers={"Authorization": f"Token {token}", "Accept-Language": "en"},
+                params={"with_cp": "true"},
+                timeout=_TIMEOUT_SECONDS,
+            )
+            if response.status_code == 429 and attempt == 0:
+                time.sleep(_RETRY_AFTER_429_SECONDS)
+                continue
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.warning(f"Could not fetch question data for post {post_id}: {e}")
+            return None
+    return None
 
 
 def is_resolved(question_json: dict[str, Any]) -> bool:
@@ -213,7 +202,7 @@ def generate_report(conn: sqlite3.Connection, token: str | None) -> str:
 
     # ---- Official scores (peer/baseline), only for questions we actually
     # submitted to Metaculus -- dry-run forecasts were never scored.
-    submitted_rows = _latest_rows_per_question(conn, dry_run=False)
+    submitted_rows = db.latest_forecasts_per_question(conn, dry_run=False)
     question_json_cache: dict[int, dict[str, Any] | None] = {}
 
     def _get(post_id: int) -> dict[str, Any] | None:
@@ -271,7 +260,7 @@ def generate_report(conn: sqlite3.Connection, token: str | None) -> str:
     # latest 'ok' forecast per question regardless of dry_run, since this
     # only needs our own predicted probability + the eventual outcome, not
     # an official Metaculus score.
-    local_rows = [r for r in _latest_rows_per_question(conn, dry_run=None) if r["question_type"] == _BINARY_QUESTION_TYPE]
+    local_rows = [r for r in db.latest_forecasts_per_question(conn, dry_run=None) if r["question_type"] == _BINARY_QUESTION_TYPE]
 
     per_model_pairs: dict[str, list[tuple[float, float]]] = {}
     ensemble_pairs: list[tuple[float, float]] = []

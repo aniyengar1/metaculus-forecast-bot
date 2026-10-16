@@ -1,11 +1,11 @@
 """
 Weekly summary of bot activity. Questions forecast, $ spent, and AskNews
 usage come entirely from our own SQLite log (data/forecasts.db) -- no API
-calls. Two exceptions: the performance report (scripts/performance_report.py)
-makes read-only GETs against the Metaculus API for resolved questions'
-official scores, and the backup-poller health section
-(scripts/dispatch_health.py) reads this repo's own GitHub Actions run
-history via the job's built-in GITHUB_TOKEN.
+calls. Three exceptions: the performance report (scripts/performance_report.py)
+and upcoming-resolutions report (scripts/upcoming_resolutions.py) make
+read-only GETs against the Metaculus API, and the backup-poller health
+section (scripts/dispatch_health.py) reads this repo's own GitHub Actions
+run history via the job's built-in GITHUB_TOKEN.
 
 Usage:
     poetry run python scripts/weekly_summary.py [--db-path data/forecasts.db] [--days 7]
@@ -28,6 +28,7 @@ from metaculus_bot import db  # noqa: E402
 
 import dispatch_health  # noqa: E402
 import performance_report  # noqa: E402
+import upcoming_resolutions  # noqa: E402
 
 _DEFAULT_REPO = "aniyengar1/metaculus-forecast-bot"
 
@@ -115,6 +116,8 @@ def summarize(conn: sqlite3.Connection, days: int) -> str:
         lines.append("\nNo alerts this window.")
 
     lines.append("\n" + performance_report.generate_report(conn, os.getenv("METACULUS_TOKEN")))
+
+    lines.append(upcoming_resolutions.generate_upcoming_resolutions_report(conn, os.getenv("METACULUS_TOKEN")))
 
     lines.append(
         dispatch_health.generate_dispatch_health_report(

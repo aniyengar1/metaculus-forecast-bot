@@ -23,6 +23,42 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
+class _FakeResponse:
+    def __init__(self, status_code: int, json_body: object = None):
+        self.status_code = status_code
+        self._json_body = json_body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._json_body
+
+
+def test_fetch_question_json_success_no_retry_needed(monkeypatch):
+    monkeypatch.setattr(pr.time, "sleep", lambda *_: None)
+    calls = []
+    monkeypatch.setattr(pr.requests, "get", lambda *a, **k: calls.append(1) or _FakeResponse(200, {"ok": True}))
+    assert pr.fetch_question_json(1, "token") == {"ok": True}
+    assert len(calls) == 1
+
+
+def test_fetch_question_json_retries_once_after_429_then_succeeds(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(pr.time, "sleep", lambda s: sleeps.append(s))
+    responses = [_FakeResponse(429), _FakeResponse(200, {"ok": True})]
+    monkeypatch.setattr(pr.requests, "get", lambda *a, **k: responses.pop(0))
+    assert pr.fetch_question_json(1, "token") == {"ok": True}
+    assert pr._RETRY_AFTER_429_SECONDS in sleeps  # backed off before the retry
+
+
+def test_fetch_question_json_two_429s_gives_up_and_returns_none(monkeypatch):
+    monkeypatch.setattr(pr.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(pr.requests, "get", lambda *a, **k: _FakeResponse(429))
+    assert pr.fetch_question_json(1, "token") is None
+
+
 def test_is_resolved():
     assert pr.is_resolved({"question": {"resolution": "yes"}})
     assert not pr.is_resolved({"question": {"resolution": None}})
