@@ -435,3 +435,76 @@ Covered by `tests/test_performance_report.py` (score_data extraction + spot
 fallback, CP-history lookup, Brier/calibration math, and an end-to-end
 `generate_report()` test with `fetch_question_json` monkeypatched -- no real
 network call in tests).
+
+## Date/numeric aggregation bug, 2026-10-16/17
+
+Found via the upcoming-resolutions table above: post 43324 ("When will
+martial law be lifted in at least 3/4 of Ukraine?") had a submitted median
+resolution date of **2024-11-26** -- before the question even opened
+(2026-04-27).
+
+**Root cause**: `build_pchip_numeric_distribution`
+(`metaculus_bot/aggregation.py`) fit a PCHIP interpolator to each model's
+own sparse elicited percentiles (e.g. 6 points spanning only that model's
+believed P10-P90 window -- for 43324, roughly a 6-18 month span), then
+evaluated that fit at a 201-point grid spanning the question's *entire*
+[lower_bound, upper_bound] range (for 43324, ~5 years). `PchipInterpolator`
+with `extrapolate=True` is only well-behaved *inside* its fitted domain;
+asked to extrapolate years beyond it, the cubic can swing wildly.
+Reproduced empirically with the question's real bounds and real elicited
+percentiles: raw extrapolated values of **600%+ "probability"** at the
+far (2022) end of the grid. `np.clip(0, 1)` clamps that to 1.0, and
+`np.maximum.accumulate` right after then locks that 1.0 in as a floor for
+the entire rest of the (chronologically later) curve -- corrupting the
+median. Reproduced the exact incident class using the real submitted
+per-model percentiles for 43324: buggy aggregate median came out to
+2024-05-03.
+
+**Fix**: before fitting PCHIP, extend the elicited percentiles with
+explicit bound anchors via `NumericDistribution`'s own
+`_add_explicit_upper_lower_bound_percentiles` -- the same private helper
+the SDK's own default (linear) CDF builder already relies on internally
+(`get_cdf` -> `_get_cdf_at`). This way the PCHIP fit's domain already
+covers the full grid and little or no extrapolation is needed. Verified:
+same real data now produces a median of 2027-05-11, consistent with both
+models' own elicited windows. Applies to `NumericQuestion`,
+`DiscreteQuestion` (a `NumericQuestion` subclass, same code path), and
+`DateQuestion` alike. Covered by `tests/test_aggregation.py`, including a
+test that fails without the fix (confirmed by reverting it) and passes
+with it.
+
+**Second, independent line of defense**: `metaculus_bot/sanity_guard.py`'s
+`check_numeric_or_date_distribution`, called from
+`FutureEvalBot._check_distribution_or_raise` right after aggregation in
+both `_run_forecast_on_numeric` and `_run_forecast_on_date`, before
+`_record_debug`/submission. Checks the final median/P10/P90 against the
+question's own bounds (a backstop -- the value axis should always be
+in-bounds by construction, so this only fires if some *other* bug breaks
+that invariant) and, for date questions, that the median is after "now".
+On failure: logs an alert (`db.log_alert`), logs a
+`status="skipped_invalid_distribution"` forecast row, and raises
+`InvalidDistributionSkipped` -- caught in `main.py` exactly like the
+existing `BudgetSkipped` pattern, so the question is skipped rather than
+submitted. Covered by `tests/test_sanity_guard.py` (the pure check) and
+`tests/test_bot_sanity_guard_wiring.py` (the bot-level wiring, using a
+lightweight stand-in for `self` rather than a full `ForecastBot`).
+
+**Audit of all 6 already-submitted numeric/date/discrete forecasts**
+(post_calibration_value re-parsed, each model's raw elicitation re-parsed
+from `raw_model_outputs` and re-aggregated with the fixed code, and the
+new guard run against what was actually submitted):
+
+| Post | Type | Status | Submitted median | Fixed-recompute median | Guard |
+|---|---|---|---|---|---|
+| 43324 | date | open | 2024-11-26 | 2027-05-11 | **FAIL** |
+| 45517 | discrete | open | 0.455 | 0.372 | pass |
+| 45960 | numeric | closed | 4.125 | 4.372 | pass |
+| 45961 | numeric | closed | 1.175e+08 | 1.168e+08 | pass |
+| 45965 | discrete | closed | 8.5 | 9.497 | pass |
+| 46052 | discrete | closed | 5.786 | 3.52 | pass |
+
+Only 43324 fails the guard and is still open -- re-forecast with the fixed
+code (real submission, replacing the bad standing forecast). The other 5
+show the expected smaller shift from the bound-anchoring fix but were
+never corrupted the way 43324 was; the 4 already-closed ones can't be
+re-forecast (and don't need to be -- they pass the guard).

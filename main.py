@@ -32,7 +32,7 @@ from forecasting_tools import (  # noqa: E402
 from forecasting_tools.data_models.questions import QuestionState  # noqa: E402
 
 from metaculus_bot import db  # noqa: E402
-from metaculus_bot.bot import BudgetSkipped, FutureEvalBot  # noqa: E402
+from metaculus_bot.bot import BudgetSkipped, FutureEvalBot, InvalidDistributionSkipped  # noqa: E402
 from metaculus_bot.budget import BudgetGuard  # noqa: E402
 from metaculus_bot.config import load_config  # noqa: E402
 from metaculus_bot.model_health import select_healthy_models  # noqa: E402
@@ -427,6 +427,7 @@ async def _run(args: argparse.Namespace) -> int:
 
         reports = []
         skipped_budget = 0
+        skipped_invalid_distribution = 0
         successful_count = 0
         attempted_count = len(questions)
         for question in questions:
@@ -438,6 +439,11 @@ async def _run(args: argparse.Namespace) -> int:
             if isinstance(report, BudgetSkipped):
                 skipped_budget += 1
                 print(f"  ⏭️  Skipped (budget): {question.page_url} -- {report}")
+                continue
+
+            if isinstance(report, InvalidDistributionSkipped):
+                skipped_invalid_distribution += 1
+                print(f"  🚫 Skipped (invalid distribution): {question.page_url} -- {report}")
                 continue
 
             if isinstance(report, BaseException):
@@ -509,6 +515,11 @@ async def _run(args: argparse.Namespace) -> int:
         )
         if skipped_budget:
             print(f"⏭️   {skipped_budget} question(s) skipped due to budget guard.\n")
+        if skipped_invalid_distribution:
+            print(
+                f"🚫   {skipped_invalid_distribution} question(s) skipped -- aggregated forecast "
+                "failed the pre-submit sanity guard (see alerts).\n"
+            )
 
         if attempted_count > 0 and successful_count == 0:
             alert_msg = (

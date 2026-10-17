@@ -110,16 +110,40 @@ def build_pchip_numeric_distribution(
     re-validates/standardizes through the SDK's own NumericDistribution so
     Metaculus's CDF validity constraints (bound pinning, min/max step per
     bin, etc) are still enforced.
+
+    Before fitting, extends the elicited percentiles with explicit anchor
+    points at the question's lower/upper bound via the SDK's own
+    _add_explicit_upper_lower_bound_percentiles -- the same private helper
+    NumericDistribution's own default (linear) CDF builder uses internally
+    (see get_cdf -> _get_cdf_at in forecasting_tools). Without this, PCHIP
+    has to extrapolate its cubic fit far outside the model's own elicited
+    range to cover the full [lower_bound, upper_bound] grid every question
+    needs -- a model confident the answer lands in a narrow window (e.g. 6
+    months of a question whose range spans 5 years) leaves PCHIP
+    extrapolating across years of empty domain. Confirmed empirically this
+    can overshoot to 600%+ raw probability, and the np.clip + a few lines
+    down then locks that overshoot in as a floor for
+    the entire rest of the curve via np.maximum.accumulate. This was the
+    root cause of a real incident (2026-10-16): a date question's submitted
+    median came out before the question even opened. See
+    docs/STAGE_B_PLAN.md "Date/numeric aggregation bug" and
+    tests/test_aggregation.py for the reproduction. (Reaches into a private
+    SDK method rather than reimplementing the same bound-anchoring
+    convention ourselves, to avoid silently drifting from Metaculus's own
+    rules -- re-verify this still exists if forecasting_tools' pinned
+    version range in pyproject.toml ever changes.)
     """
     elicited_sorted = sorted(elicited_percentiles, key=lambda p: p.percentile)
-    xs = _dedupe_strictly_increasing([p.value for p in elicited_sorted])
-    ys = [p.percentile for p in elicited_sorted]
 
     # SDK-correct x-axis grid (bound/zero-point aware), independent of
     # interpolation method -- get it for free from a scaffold distribution
     # built the default (linear) way, we only use its x-values.
     scaffold = NumericDistribution.from_question(elicited_sorted, question)
     grid_xs = [p.value for p in scaffold.get_cdf()]
+
+    bounded_percentiles = scaffold._add_explicit_upper_lower_bound_percentiles(elicited_sorted)
+    xs = _dedupe_strictly_increasing([p.value for p in bounded_percentiles])
+    ys = [p.percentile for p in bounded_percentiles]
 
     pchip = PchipInterpolator(xs, ys, extrapolate=True)
     raw_ys = pchip(grid_xs)

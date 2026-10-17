@@ -68,6 +68,7 @@ from metaculus_bot.deterministic_parse import (
 )
 from metaculus_bot.llm_retry import invoke_with_backoff
 from metaculus_bot import provider_quota
+from metaculus_bot.sanity_guard import check_numeric_or_date_distribution
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,13 @@ class BudgetSkipped(Exception):
     because forecasting it would exceed the per-question or per-day cap."""
 
 
+class InvalidDistributionSkipped(Exception):
+    """Raised (and already logged to SQLite + alerts) when a numeric/date
+    question's aggregated forecast fails the pre-submit sanity guard (see
+    metaculus_bot/sanity_guard.py) -- we do not submit a forecast we know
+    is nonsensical (e.g. a resolution date already in the past)."""
+
+
 @dataclass
 class ModelRunResult:
     model: str
@@ -215,6 +223,39 @@ class FutureEvalBot(ForecastBot):
             error_message=reason,
         )
         raise BudgetSkipped(reason)
+
+    def _check_distribution_or_raise(
+        self, question: NumericQuestion | DateQuestion, aggregate: NumericDistribution
+    ) -> None:
+        """Pre-submit sanity guard for numeric/date forecasts -- see
+        metaculus_bot/sanity_guard.py and docs/STAGE_B_PLAN.md
+        "Date/numeric aggregation bug" for why this exists."""
+        reason = check_numeric_or_date_distribution(aggregate, question)
+        if reason is None:
+            return
+        msg = f"Pre-submit sanity guard failed for {question.page_url}: {reason}"
+        logger.error(msg)
+        db.log_alert(self.db_conn, msg)
+        db.log_forecast(
+            self.db_conn,
+            question_id=question.id_of_question,
+            post_id=question.id_of_post,
+            question_title=question.question_text,
+            question_type=type(question).__name__,
+            question_url=question.page_url,
+            research_summary="",
+            raw_model_outputs=[],
+            aggregate_value=None,
+            post_calibration_value=None,
+            submitted_value=None,
+            dry_run=self.dry_run,
+            models_used=self.models,
+            n_runs=self.n_runs,
+            cost_usd=0.0,
+            status="skipped_invalid_distribution",
+            error_message=reason,
+        )
+        raise InvalidDistributionSkipped(reason)
 
     ##################################### RESEARCH #####################################
 
@@ -614,6 +655,7 @@ class FutureEvalBot(ForecastBot):
         aggregate = await NumericReport.aggregate_predictions(
             [r.value for r in successes], question
         )
+        self._check_distribution_or_raise(question, aggregate)
         self._record_debug(
             question, results, aggregate.get_representative_percentiles(), aggregate.get_representative_percentiles()
         )
@@ -681,6 +723,7 @@ class FutureEvalBot(ForecastBot):
         aggregate = await NumericReport.aggregate_predictions(
             [r.value for r in successes], question
         )
+        self._check_distribution_or_raise(question, aggregate)
         self._record_debug(
             question, results, aggregate.get_representative_percentiles(), aggregate.get_representative_percentiles()
         )
