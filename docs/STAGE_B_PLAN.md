@@ -508,3 +508,72 @@ code (real submission, replacing the bad standing forecast). The other 5
 show the expected smaller shift from the bound-anchoring fix but were
 never corrupted the way 43324 was; the 4 already-closed ones can't be
 re-forecast (and don't need to be -- they pass the guard).
+
+## Follow-up, 2026-10-18: re-audit of all still-open questions + retry confirmation
+
+**43324 re-forecast, confirmed live**: submitted median moved from
+2024-11-26 (bad) to 2027-03-19 (sane, after both now and the question's
+open_time), P10=2026-08-10, P90=2027-05-28 -- passes the guard. The forced
+re-forecast required `--mode test_questions` (the only way `--post-ids`
+bypasses the already-forecasted safety net in `main.py`), which records
+`tournament="test"` locally -- cosmetic bookkeeping only, doesn't affect
+the real Metaculus submission. That run was local (not a GitHub Actions
+job), so its log row never reached the shared `data` branch automatically
+-- merged it in by hand (attached the local db, copied just that one row
+by `post_id`+`run_timestamp`, verified the row count went from 28 to 29
+with no duplication) and pushed via the existing
+`scripts/persist_data_branch.sh`.
+
+**Re-audit of both still-open numeric/discrete/date questions**
+(recomputing from each model's actual `raw_model_outputs.raw_text`,
+re-parsed through the production parsers and the fixed
+`build_pchip_numeric_distribution`, compared against the submitted CDF
+pulled live):
+
+| Post | Submitted median | Fixed-recompute median | Max CDF diff | Note |
+|---|---|---|---|---|
+| 43324 | 2027-03-19 | 2027-05-28 (unreliable, see below) | 0.37 (unreliable) | Already re-forecast above; live-API value is authoritative |
+| 45517 | 0.373 | 0.372 | 0.048 | Negligible -- no action needed |
+
+43324's "recompute" in this re-audit is **not a reliable comparison** and
+should be disregarded: 2 of the original run's 3 models couldn't be
+re-parsed from their stored `raw_model_outputs.raw_text` --
+`groq/openai/gpt-oss-120b` legitimately used the LLM-fallback parser
+originally (consistent, not a bug), but `groq/qwen/qwen3.8-27b` genuinely
+*could* have been re-parsed except that `_record_debug` truncates
+`raw_text` to 4000 characters for storage, and this model's answer block
+happened to fall past that cutoff. The recompute above is therefore built
+from only 1 of 3 original models and isn't apples-to-apples -- the
+authoritative check for 43324 is the live-API-confirmed submitted value
+above, independently verified to pass the guard. (The 4000-char truncation
+is a pre-existing storage limit, not addressed here -- it only affects
+retrospective audits like this one, not the original live run, which
+always parses from the full untruncated text in memory.)
+
+45517's recompute is reliable (all 3 models cleanly re-parsed, no
+truncation hit) and shows a negligible difference -- it was never
+corrupted and doesn't need re-forecasting, consistent with it passing the
+guard both before and after.
+
+**Retry-on-429/5xx confirmed already in place for the main bot**: traced
+`forecasting_tools`' `MetaculusClient` (the SDK `bot.py`/`main.py` use
+directly for all Metaculus calls -- no direct `requests.get/post` to
+Metaculus anywhere in our own bot code). `get_question_by_post_id`,
+`_get_questions_from_api` (underlies
+`get_all_open_questions_from_tournament`/`get_questions_matching_filter`,
+i.e. all our question fetching), `post_question_comment`, and
+`_post_question_prediction` (underlies all three
+`post_*_question_prediction` submission methods) are each wrapped in the
+SDK's own `retry_with_exponential_backoff()` -- up to 3 retries, which
+catches `requests.exceptions.RequestException` (the base class
+`HTTPError` derives from, so 429/5xx responses are covered, along with
+connection/timeout errors). No code change needed here. Added
+`tests/test_metaculus_retry.py` to prove this *behaviorally* (mocking a
+429/503 then a successful response, for both a fetch and two submission
+paths) rather than just asserting a decorator is present, so a future
+`forecasting_tools` version silently dropping this would be caught by our
+own test suite. The only other direct-to-Metaculus HTTP calls in this repo
+are in `scripts/performance_report.py`'s `fetch_question_json` (used by
+both the performance report and the upcoming-resolutions report), which
+already got the same retry treatment in an earlier round -- see
+"Performance report" above.
