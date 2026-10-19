@@ -1,5 +1,5 @@
 """
-Self-healing model roster: before each run, health-checks every candidate in
+Self-healing model roster: before each run, health-checks candidates in
 cfg.model_pool with a tiny request, then selects the first `target_count`
 healthy models in pool order.
 
@@ -16,22 +16,44 @@ models, then an OpenRouter :free fallback tier), so preferring one-per-
 provider would actually fight the intended ordering -- it would skip the
 second (intentional) Groq model in favor of jumping straight to the
 OpenRouter fallback tier. See docs/STAGE_B_PLAN.md "Multi-provider pool".
+
+Two cost-control measures added 2026-10-19 after OpenRouter's entire
+50/day account-wide free-tier cap got burned by health checks alone (0 real
+forecast calls that day) within about 2 hours of the GCP VM backup poller
+running every ~10 min -- every run was health-checking all 4 OpenRouter
+fallback models even though Gemini/Groq (the primary tier) were healthy the
+whole time and never actually needed the fallback:
+
+1. The OpenRouter fallback tier (any model whose provider_of() returns
+   "openrouter") is only health-checked at all if the primary
+   (non-OpenRouter) models don't already satisfy target_count.
+2. Every health check result (primary or fallback) is cached in SQLite for
+   1 hour (metaculus_bot.db.get_cached_model_health/set_cached_model_health)
+   -- a model doesn't get re-pinged more than once per hour regardless of
+   how often the bot itself runs.
+
+See docs/STAGE_B_PLAN.md "OpenRouter health-check quota drain" for the
+measured before/after numbers.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from dataclasses import dataclass
 
 from forecasting_tools import GeneralLlm
 
+from metaculus_bot import db
 from metaculus_bot.llm_retry import invoke_with_backoff
+from metaculus_bot.model_naming import provider_of
 
 logger = logging.getLogger(__name__)
 
 _HEALTH_CHECK_PROMPT = "Reply with exactly one word: OK"
 _HEALTH_CHECK_TIMEOUT_SECONDS = 20
 _HEALTH_CHECK_MAX_TRIES = 3  # reuses the same backoff as real forecast calls
+_HEALTH_CACHE_TTL_SECONDS = 3600
 
 
 @dataclass
@@ -54,15 +76,48 @@ async def _check_one(model: str) -> HealthResult:
         return HealthResult(model=model, healthy=False, error=error)
 
 
+async def _check_models_cached(conn: sqlite3.Connection, models: list[str]) -> dict[str, HealthResult]:
+    """Checks only the models not already cached (<=1h old); reuses the
+    cached verdict for everything else -- no network call at all for a
+    model checked within the last hour."""
+    results: dict[str, HealthResult] = {}
+    to_check: list[str] = []
+    for model in models:
+        cached = db.get_cached_model_health(conn, model, _HEALTH_CACHE_TTL_SECONDS)
+        if cached is not None:
+            healthy, error = cached
+            results[model] = HealthResult(model=model, healthy=healthy, error=error)
+        else:
+            to_check.append(model)
+
+    if to_check:
+        fresh = await asyncio.gather(*[_check_one(m) for m in to_check])
+        for r in fresh:
+            results[r.model] = r
+            db.set_cached_model_health(conn, r.model, r.healthy, r.error)
+
+    return results
+
+
 async def select_healthy_models(
-    model_pool: list[str], target_count: int = 3
+    conn: sqlite3.Connection, model_pool: list[str], target_count: int = 3
 ) -> tuple[list[str], list[HealthResult]]:
     """
-    Health-checks every model in `model_pool` concurrently, then returns
-    (selected, all_results). `selected` is the first `target_count` healthy
-    models in pool order.
+    Health-checks `model_pool` (cached results preferred -- see
+    _check_models_cached), then returns (selected, all_results). `selected`
+    is the first `target_count` healthy models in pool order. Only checks
+    the OpenRouter fallback tier if the primary models don't already
+    satisfy `target_count` -- see module docstring.
     """
-    results = await asyncio.gather(*[_check_one(m) for m in model_pool])
-    results_by_model = {r.model: r for r in results}
-    selected = [m for m in model_pool if results_by_model[m].healthy][:target_count]
-    return selected, results
+    primary = [m for m in model_pool if provider_of(m) != "openrouter"]
+    fallback = [m for m in model_pool if provider_of(m) == "openrouter"]
+
+    results = await _check_models_cached(conn, primary)
+    healthy_primary = [m for m in primary if results[m].healthy]
+
+    if len(healthy_primary) < target_count and fallback:
+        results.update(await _check_models_cached(conn, fallback))
+
+    selected = [m for m in model_pool if results.get(m) and results[m].healthy][:target_count]
+    all_results = [results[m] for m in model_pool if m in results]
+    return selected, all_results

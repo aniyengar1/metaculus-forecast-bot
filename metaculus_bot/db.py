@@ -84,6 +84,13 @@ CREATE TABLE IF NOT EXISTS provider_learned_limits (
     learned_at TEXT NOT NULL,
     PRIMARY KEY (provider, model)
 );
+
+CREATE TABLE IF NOT EXISTS model_health_cache (
+    model TEXT PRIMARY KEY,
+    healthy INTEGER NOT NULL,
+    error TEXT,
+    checked_at TEXT NOT NULL
+);
 """
 
 
@@ -330,6 +337,37 @@ def get_learned_rpd_limit(conn: sqlite3.Connection, provider: str, model: str) -
         (provider, model),
     ).fetchone()
     return int(row[0]) if row else None
+
+
+def set_cached_model_health(conn: sqlite3.Connection, model: str, healthy: bool, error: str | None) -> None:
+    conn.execute(
+        """
+        INSERT INTO model_health_cache (model, healthy, error, checked_at) VALUES (?, ?, ?, ?)
+        ON CONFLICT(model) DO UPDATE SET healthy = excluded.healthy, error = excluded.error, checked_at = excluded.checked_at
+        """,
+        (model, 1 if healthy else 0, error, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def get_cached_model_health(
+    conn: sqlite3.Connection, model: str, max_age_seconds: int
+) -> tuple[bool, str | None] | None:
+    """Returns (healthy, error) if a health check for this model was cached
+    within the last `max_age_seconds`, else None (caller should check
+    fresh). See metaculus_bot/model_health.py -- this is what stops the
+    OpenRouter fallback tier (and everything else) from being re-pinged on
+    every single run."""
+    row = conn.execute(
+        "SELECT healthy, error, checked_at FROM model_health_cache WHERE model = ?", (model,)
+    ).fetchone()
+    if not row:
+        return None
+    checked_at = datetime.fromisoformat(row[2])
+    age_seconds = (datetime.now(timezone.utc) - checked_at).total_seconds()
+    if age_seconds > max_age_seconds:
+        return None
+    return bool(row[0]), row[1]
 
 
 def get_last_forecast_time(conn: sqlite3.Connection, question_id: int) -> datetime | None:

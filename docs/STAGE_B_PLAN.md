@@ -711,5 +711,73 @@ confirming local runs are still correctly guarded.
 roughly an hour (~07:05-08:10 UTC) before this was caught and fixed;
 native `schedule:` ticks kept working throughout, so coverage wasn't a
 total outage, just reduced back toward GitHub's already-known-unreliable
-cadence for that window. See the post-fix verification run further down
-for exact failure counts and whether any question's window was missed.
+cadence for that window.
+
+**Post-fix verification**: manually dispatched both workflows after
+pushing `af2ecc7`. MiniBench succeeded immediately. Seasonal's first
+manual dispatch was *cancelled*, not failed -- it got superseded while
+queued by the backup poller's own concurrent dispatch landing right
+behind it in the same shared concurrency group (not a sign of a problem;
+confirmed by re-dispatching immediately, which succeeded). Confirmed the
+fix was the actual cause, not coincidence: the successful run's log has
+no `OpenRouter free-model daily quota:` line at all -- `IS_CI_RUN`
+returned early before even checking.
+
+**Follow-up audit, same day -- no missed questions, but a second real bug
+found**:
+
+1. **Missed-question check**: cross-referenced the actual gap windows
+   (MiniBench: 07:25:01-08:39:39 UTC, ~1h15m with zero successful checks;
+   Seasonal: 07:04:41-08:42:23 UTC, ~1h38m) against every MiniBench/
+   seasonal question that opened that morning, via the live API's
+   `my_forecasts` field (authoritative, independent of our own log) and
+   our own `_check_closed_unforecast` alert (zero alerts logged all day).
+   Every question that opened before or during either gap was confirmed
+   forecasted; none opened and closed entirely within a gap. No questions
+   missed.
+
+2. **Why OpenRouter quota was dropping at all, given it's fallback-only**:
+   `model_health.select_healthy_models` health-checked *every* model in
+   `cfg.model_pool` on *every* run, unconditionally -- including all 4
+   OpenRouter fallback candidates, even though Gemini+Groq (the primary
+   tier) were healthy the entire day and the fallback tier was never once
+   actually needed for a real forecast. Measured directly: OpenRouter's
+   own API reported 40/50 used that day; our own `provider_usage` table
+   (which only records real forecast/parser calls, not health checks)
+   showed 0 OpenRouter usage for the same day. All 40 requests were health
+   checks. At 4 OpenRouter models/run x the backup poller's ~6-12 runs/
+   hour, that alone exhausts the 50/day cap in 1-2 hours regardless of
+   whether a single real forecast ever touches OpenRouter.
+
+   **Fix**, `metaculus_bot/model_health.py`: `select_healthy_models` now
+   splits the pool into primary (non-OpenRouter, via the existing
+   `model_naming.provider_of`) and fallback (OpenRouter) tiers, and only
+   health-checks the fallback tier if the primary tier doesn't already
+   satisfy `target_count`. Every health check result (either tier) is
+   also cached in SQLite for 1 hour (`db.get_cached_model_health`/
+   `set_cached_model_health`, new `model_health_cache` table) so a model
+   isn't re-pinged more than once per hour regardless of run frequency.
+   Covered by `tests/test_model_health.py` (6 tests: fallback
+   skipped/checked in each case, cache hit/miss/expiry). Verified against
+   two real local runs too: when Gemini transiently timed out (a real,
+   unrelated flake hit twice while testing), the fallback tier correctly
+   got checked -- confirming both branches work, not just the happy path.
+
+3. **CI daily-question budgeting**: already correct, no change needed.
+   `provider_quota.compute_daily_question_budget` (called unconditionally
+   in `main.py`, no `IS_CI_RUN` gating) computes the daily throttle from
+   the *actually selected* models' real remaining quota every run (via
+   `get_remaining_quota`, which routes to Groq's published RPD table or
+   Gemini's self-learned limit) -- not from OpenRouter at all. The
+   OpenRouter-specific guard that just got fixed is a separate, earlier-
+   stage pre-flight check (abort before spending anything on a run that's
+   clearly not going to accomplish anything); the per-run question
+   *budget* was never OpenRouter-based to begin with.
+
+4. **Cancelled (concurrency-superseded) runs and notifications**: confirmed
+   directly against this account's actual GitHub notification inbox
+   (`gh api notifications`, not just GitHub's general docs) that every
+   notification generated that day corresponds 1:1 with a genuine
+   `failure` conclusion; the cancelled run (08:39:41-08:40:05 UTC)
+   produced zero notification entries. Cancelled runs do not trigger
+   failure emails/notifications for this account.

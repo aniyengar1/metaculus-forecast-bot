@@ -322,7 +322,7 @@ async def _run(args: argparse.Namespace) -> int:
 
         print(f"Health-checking model pool ({len(cfg.model_pool)} candidates)...")
         selected_models, health_results = await select_healthy_models(
-            cfg.model_pool, target_count=cfg.target_ensemble_size
+            conn, cfg.model_pool, target_count=cfg.target_ensemble_size
         )
         for r in health_results:
             status = "healthy" if r.healthy else f"DEAD -- {r.error}"
@@ -342,7 +342,7 @@ async def _run(args: argparse.Namespace) -> int:
 
         print(f"Health-checking parser pool ({len(cfg.parser_model_pool)} candidates)...")
         parser_candidates, parser_health_results = await select_healthy_models(
-            cfg.parser_model_pool, target_count=1
+            conn, cfg.parser_model_pool, target_count=1
         )
         for r in parser_health_results:
             status = "healthy" if r.healthy else f"DEAD -- {r.error}"
