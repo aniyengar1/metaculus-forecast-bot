@@ -160,7 +160,10 @@ def calibration_table(pairs: list[tuple[float, float]], n_bins: int = _CALIBRATI
     return table
 
 
-def _safe_float(value: str | None) -> float | None:
+def _safe_float(value: str | float | None) -> float | None:
+    """Handles both the pre-2026-10-18 format (raw_model_outputs'
+    parsed_value stored as a stringified repr) and the current one (a
+    plain JSON float for binary rows) -- float() accepts either."""
     if value is None or value == "None":
         return None
     try:

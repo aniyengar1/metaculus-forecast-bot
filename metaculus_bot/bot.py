@@ -89,6 +89,13 @@ _STAGGER_SECONDS = 1.5
 # way. See docs/STAGE_B_PLAN.md "Comment privacy and length".
 _MAX_COMMENT_CHARS = 1500
 
+# Was 4000 -- found (2026-10-17/18) to actually cut off a real model's
+# answer block mid-reasoning, breaking any later re-parse attempt (see
+# docs/STAGE_B_PLAN.md "raw_text truncation"). Raised to a size confirmed
+# generous enough in practice (typical full responses measured well under
+# this) while still bounding a pathological runaway/repeating response.
+_MAX_RAW_TEXT_CHARS = 20_000
+
 
 def _short_value_repr(value: Any) -> str:
     """A short (<=~80 char) human-readable summary of one model's parsed
@@ -113,6 +120,30 @@ def _short_value_repr(value: Any) -> str:
         except Exception:
             return "(distribution)"
     return str(value)[:80]
+
+
+def _structured_parsed_value(result: ModelRunResult) -> Any:
+    """A clean, JSON-serializable representation of one model's parsed
+    forecast, stored alongside (not instead of) the raw text -- so later
+    analysis (e.g. scripts/performance_report.py's per-model Brier) never
+    needs to re-parse raw_text, which is lossy once truncated (confirmed
+    2026-10-17/18: a 4000-char raw_text cap cut off a model's answer block
+    entirely for one real question, see docs/STAGE_B_PLAN.md). For
+    numeric/date, stores the model's own SPARSE elicited percentiles (e.g.
+    6 points: P10/20/40/60/80/90 -- what it actually said) rather than the
+    ~201-point PCHIP-expanded distribution built from them: smaller, and an
+    exact reproduction of the real input to aggregation, needing no
+    raw_text at all."""
+    value = result.value
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return value
+    if isinstance(value, PredictedOptionList):
+        return {o.option_name: o.probability for o in value.predicted_options}
+    if isinstance(value, NumericDistribution) and result.parsed_percentiles is not None:
+        return [{"percentile": p.percentile, "value": p.value} for p in result.parsed_percentiles]
+    return None
 
 
 def _force_private_and_cap_length(client: MetaculusClient) -> None:
@@ -160,6 +191,9 @@ class ModelRunResult:
     value: Any = None
     error: str | None = None
     parse_method: str = "deterministic"  # or "llm_fallback"
+    # The model's own sparse elicited percentiles (numeric/date only,
+    # before PCHIP expansion) -- see _structured_parsed_value.
+    parsed_percentiles: list[Percentile] | None = None
 
 
 def _question_key(question: MetaculusQuestion) -> int | str:
@@ -631,6 +665,7 @@ class FutureEvalBot(ForecastBot):
                 raw_text=reasoning,
                 value=distribution,
                 parse_method=parse_method,
+                parsed_percentiles=percentiles,
             )
         except Exception as e:
             logger.warning(f"Model run failed (numeric, model={model_name}, run={run_index}): {e}")
@@ -699,6 +734,7 @@ class FutureEvalBot(ForecastBot):
                 raw_text=reasoning,
                 value=distribution,
                 parse_method=parse_method,
+                parsed_percentiles=percentiles,
             )
         except Exception as e:
             logger.warning(f"Model run failed (date, model={model_name}, run={run_index}): {e}")
@@ -745,8 +781,8 @@ class FutureEvalBot(ForecastBot):
             {
                 "model": r.model,
                 "run_index": r.run_index,
-                "raw_text": (r.raw_text or "")[:4000],
-                "parsed_value": str(r.value) if r.value is not None else None,
+                "raw_text": (r.raw_text or "")[:_MAX_RAW_TEXT_CHARS],
+                "parsed_value": _structured_parsed_value(r) if r.error is None else None,
                 "error": r.error,
                 "parse_method": r.parse_method if r.error is None else None,
             }

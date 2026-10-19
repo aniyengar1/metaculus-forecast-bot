@@ -577,3 +577,95 @@ are in `scripts/performance_report.py`'s `fetch_question_json` (used by
 both the performance report and the upcoming-resolutions report), which
 already got the same retry treatment in an earlier round -- see
 "Performance report" above.
+
+## raw_text truncation + structured parsed_value, 2026-10-18/19
+
+The 4000-char `raw_text` cap (`_record_debug` in `metaculus_bot/bot.py`)
+was found, while auditing the date-aggregation bug above, to cut off a
+real model's answer block entirely before it reached the actual
+percentile lines -- meaning retrospective analysis that needs to
+re-derive a value from `raw_text` can silently lose data, and the
+existing `parsed_value` field was just `str(r.value)` (a Python repr --
+exact for a model's own analysis but not valid JSON for anything except
+binary, so multiple-choice/numeric/date values needed fragile
+regex-from-repr parsing, as several scripts in this session already had
+to do).
+
+**Fix 1 -- store each model's parsed value cleanly, separately from
+raw_text**: `ModelRunResult` gained a `parsed_percentiles` field (the
+model's own *sparse* elicited percentiles, e.g. 6 points, before PCHIP
+expansion), threaded through `_single_numeric_run`/`_single_date_run`.
+`_record_debug` now calls a new `_structured_parsed_value(result)`
+instead of `str(r.value)`: a plain float for binary, `{option: prob}` for
+multiple choice, and `[{"percentile": p, "value": v}, ...]` (the sparse
+elicitation, not the ~201-point expanded CDF) for numeric/discrete/date.
+All directly JSON-usable -- no re-parsing needed by any later analysis
+script. Covered by `tests/test_structured_parsed_value.py`.
+
+**Fix 2 -- store raw_text (near-)untruncated**: cap raised from 4000 to
+`_MAX_RAW_TEXT_CHARS = 20_000`. Measured real full-length raw_text across
+this session's live runs and the full production history (76 model-run
+entries): average 2308 chars, max 4000 (i.e. every sample at or near the
+old cap *was* the old cap -- genuinely truncated), only 14.5% of entries
+ever hit it. 20,000 is ~5x the old cap and ~9x the observed average --
+functionally untruncated in practice while still bounding a pathological
+runaway/repeating response. No compression needed (see size measurement
+below) -- plain text, same as before, just a higher cap.
+
+**DB size impact, measured (not estimated) against the real production
+`data/forecasts.db`**:
+- Current file size: 639 KB (29 rows, 27 with model outputs, 76
+  individual model-run entries after the backfill below).
+- `raw_model_outputs` is 32% of the file (206 KB); the new `parsed_value`
+  field itself adds under 0.2% (11 bytes out of a 7.4 KB entry, measured
+  on a real binary question) -- raw_text dominates, as expected.
+- Removing the 4000-char cap: of the 76 real entries, only 11 (14.5%)
+  were ever at the cap; even assuming a generous 2x overshoot for all of
+  them if uncapped, that's roughly +44 KB one-time catch-up on the
+  existing history -- under 7% of current file size.
+- **The bigger size driver, measured directly, isn't the cap at all --
+  it's the git-branch-as-storage architecture itself**: `scripts/
+  persist_data_branch.sh` commits a full new blob of the whole db file on
+  every run that changes it (SQLite's on-disk format doesn't diff well
+  byte-for-byte even for a one-row change, so git can't delta-compress
+  these effectively). Measured locally: 29 commits on the `data` branch
+  over ~10 days have added 5.6 MB of (loose, unpacked) git objects across
+  both branches combined -- roughly 560 KB/day at the current ~3
+  real-commits/day rate. Extrapolated linearly across the ~75 days
+  remaining in the tournament (through 2027-01-06): **~40-50 MB total**
+  git history by the end, even as the db itself keeps growing. This is
+  comfortably within normal repo size (GitHub's practical concerns start
+  in the multi-GB range) and matches `restore_data_branch.sh`'s own
+  original call: "a slowly-growing binary blob in git history... a
+  non-issue at this scale." No action taken here -- flagging the number
+  because it was asked for, not because it needs fixing.
+
+**Fix 3 -- backfill existing rows**: `scripts/backfill_parsed_values.py`
+migrates every existing row's old-format `parsed_value` (the `str(value)`
+repr) to the new clean format -- deliberately extracted from that
+*existing* repr string, not by re-parsing `raw_text`. Key realization:
+the repr was always built from the full in-memory value, before any
+truncation was ever applied (truncation only ever hit `raw_text`, a
+separate dict key) -- so backfill via the repr recovers data the
+raw_text re-parsing approach (used elsewhere in this session's earlier
+audits) could not, with zero raw_text dependency at all.
+  - Binary: the repr is already a plain float string -- exact, lossless.
+  - Multiple choice: regex-extracts `option_name=.../probability=...`
+    pairs from the `PredictedOptionList` repr -- exact, lossless.
+  - Numeric/discrete/date: regex-extracts `Percentile(percentile=..,
+    value=..)` pairs from the `NumericDistribution` repr. This is the
+    already-built ~201-point expanded CDF, not the model's original
+    sparse elicitation (not recoverable for historical rows without
+    `raw_text`, which may itself be truncated) -- backfilled rows
+    therefore store 3 *representative* percentiles (closest match to
+    10/50/90) from that expanded distribution, a coarser provenance than
+    what new rows store going forward. Documented in the script.
+  - **Result, run against the real production db**: 27 rows scanned, all
+    27 changed, 76 entries migrated, 0 failures, 5 entries correctly left
+    `None` (the model run itself had errored -- nothing to recover).
+    Final db size: 639 KB (was 631 KB -- the clean JSON format is
+    actually smaller than the verbose Python repr it replaced, despite
+    adding the new structured field). Pushed to the `data` branch via the
+    existing `scripts/persist_data_branch.sh`. Covered by
+    `tests/test_backfill_parsed_values.py`, including an idempotency
+    test (safe to re-run against already-migrated rows).
