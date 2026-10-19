@@ -56,13 +56,20 @@ TOURNAMENT_URLS = {
 
 _TYPE_PRIORITY = [BinaryQuestion, MultipleChoiceQuestion, NumericQuestion, DateQuestion, DiscreteQuestion]
 
-# GitHub Actions sets GITHUB_EVENT_NAME=schedule only for cron-triggered runs
-# (not workflow_dispatch, and unset entirely when run locally). The rate
-# limit guard below exempts exactly this case -- it exists to stop
-# local/manual runs from starving the scheduled production run of shared
-# account-wide OpenRouter quota, so the production run itself must never be
-# the thing it blocks.
-IS_SCHEDULED_RUN = os.getenv("GITHUB_EVENT_NAME") == "schedule"
+# Was: os.getenv("GITHUB_EVENT_NAME") == "schedule" -- correct back when
+# workflow_dispatch only ever meant a human manually testing in the GH UI.
+# Broke 2026-10-19: the GCP VM backup poller (docs/STAGE_B_PLAN.md "Backup
+# poller", added because GitHub's own schedule: trigger was silently
+# skipping ~96% of ticks) also fires via workflow_dispatch every ~10 min --
+# so once OpenRouter quota dipped below the reserve threshold partway
+# through the day, this guard misclassified every one of *those* (the
+# actual production runs) as "local/manual" and refused to start, while
+# the few remaining native schedule: ticks kept succeeding. GITHUB_ACTIONS
+# is set to "true" for every GitHub Actions run regardless of trigger event
+# (schedule or workflow_dispatch) and unset when run locally -- that's the
+# real distinction this guard needs: "CI run" vs "someone's laptop," not
+# "which trigger fired it."
+IS_CI_RUN = os.getenv("GITHUB_ACTIONS") == "true"
 
 
 def _check_rate_limit_guard(cfg) -> bool:
@@ -71,7 +78,7 @@ def _check_rate_limit_guard(cfg) -> bool:
     cleanly (it surfaces as an ugly 'Task exception was never retrieved'
     instead of a clean exit), so the actual process exit happens once in
     __main__, after the event loop has finished."""
-    if IS_SCHEDULED_RUN:
+    if IS_CI_RUN:
         return True
 
     quota = get_free_model_daily_quota()

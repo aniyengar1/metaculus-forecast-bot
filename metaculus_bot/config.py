@@ -126,10 +126,11 @@ class Config:
     # it does not drive normal-day behavior anymore. See docs/STAGE_B_PLAN.md.
     max_questions_per_day_ceiling: int = 20
 
-    # Pre-flight OpenRouter quota guard for local/manual runs only (the
-    # actual scheduled cron run is exempt -- see main.py's IS_SCHEDULED_RUN).
-    # Reserve = 1 health-check pass (~10) + 1 question (~5) so the *next*
-    # scheduled run still has a realistic chance to do something.
+    # Pre-flight OpenRouter quota guard for local (non-CI) runs only --
+    # any GitHub Actions run (scheduled or workflow_dispatch) is exempt,
+    # see main.py's IS_CI_RUN. Reserve = 1 health-check pass (~10) + 1
+    # question (~5) so the *next* scheduled run still has a realistic
+    # chance to do something.
     min_quota_reserve_for_scheduled_run: int = 15
     enforce_rate_limit_guard: bool = True
 

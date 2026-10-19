@@ -669,3 +669,47 @@ audits) could not, with zero raw_text dependency at all.
     existing `scripts/persist_data_branch.sh`. Covered by
     `tests/test_backfill_parsed_values.py`, including an idempotency
     test (safe to re-run against already-migrated rows).
+
+## Both workflows failing, 2026-10-19 -- rate-limit guard misclassified backup-poller runs
+
+Both `run_bot_on_minibench.yaml` and `run_bot_on_seasonal.yaml` started
+failing on every `workflow_dispatch`-triggered run starting ~07:05-07:10
+UTC. **Not** the Ubuntu 24.04 -> 26.04 `ubuntu-latest` migration (the
+initial hypothesis) -- checked the actual failed runs' "Set up job" step:
+`Image: ubuntu-24.04`, still the old image at the time of failure, and
+every environment-setup step (checkout, Python, poetry install) succeeded
+cleanly in every failed run inspected.
+
+**Actual cause**: `main.py`'s pre-flight OpenRouter quota guard
+(`_check_rate_limit_guard`) exists to stop local/manual runs from eating
+quota reserved for the next scheduled production run. It exempted itself
+only when `GITHUB_EVENT_NAME == "schedule"` -- correct back when
+`workflow_dispatch` only ever meant a human manually testing via the GH
+UI. The GCP VM backup poller (added because GitHub's native `schedule:`
+trigger was silently skipping ~96% of ticks -- see "Backup poller" above)
+also fires via `workflow_dispatch`, every ~10 minutes. Once OpenRouter
+free-tier quota dipped below the 15-request reserve threshold partway
+through the day (used increased from normal traffic), the guard started
+refusing every one of *those* dispatch-triggered runs -- which by then
+were the actual production traffic, not local testing -- while the
+handful of remaining native `schedule:` ticks kept succeeding right
+alongside the failures (confirmed in `gh run list`'s `event` column: every
+failure is `workflow_dispatch`, every success in the same window is
+`schedule`).
+
+**Fix**: `IS_CI_RUN` (renamed from `IS_SCHEDULED_RUN`) now checks
+`GITHUB_ACTIONS == "true"` instead of `GITHUB_EVENT_NAME == "schedule"`.
+`GITHUB_ACTIONS` is set to `"true"` for every GitHub Actions run
+regardless of which trigger fired it (schedule or workflow_dispatch) and
+unset when run locally -- the real distinction this guard needs is
+"running in CI" vs "someone's laptop," not which specific trigger fired
+it. Covered by `tests/test_rate_limit_guard.py`, including the exact
+regression (a `workflow_dispatch`-event CI run must be exempt) and
+confirming local runs are still correctly guarded.
+
+**Impact**: both workflows failed on every `workflow_dispatch` tick for
+roughly an hour (~07:05-08:10 UTC) before this was caught and fixed;
+native `schedule:` ticks kept working throughout, so coverage wasn't a
+total outage, just reduced back toward GitHub's already-known-unreliable
+cadence for that window. See the post-fix verification run further down
+for exact failure counts and whether any question's window was missed.
