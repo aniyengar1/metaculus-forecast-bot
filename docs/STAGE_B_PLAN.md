@@ -1026,6 +1026,106 @@ Gemini model, explicitly skipped per the plan above):**
 Verified: 131/131 tests pass (18 new this round: 7 in `test_llm_retry.py`,
 2 updated + 1 new in `test_model_health.py`, plus the `test_db.py`/
 `test_performance_report.py` additions from the calibration-tracking work
-above), pyflakes clean, all 3 touched workflow YAML files parse. Next
-step: confirm the next MiniBench + seasonal runs still pass post-push, then
-check back in ~24h on how often Gemini actually makes the ensemble now.
+above), pyflakes clean, all 3 touched workflow YAML files parse.
+
+**Post-push check (within ~10 min of `8de2ad8`):** both forecast workflows'
+next 2 runs each (minibench 01:00Z/01:10Z, seasonal 00:55Z/01:05Z) completed
+`success`. Zero failed runs across all 5 workflows in the following 8h.
+One real forecast logged in that window (06:07Z) -- Gemini missing from it,
+but the log showed the new retry logic firing exactly as designed:
+`gemini/gemini-3.8-flash` timed out 3/3 attempts (2s/4s backoff between),
+~46s total, before being marked unhealthy -- a sustained timeout the retry
+correctly couldn't ride out, not a case of the fix not working.
+
+## gemini-3.8-flash latency measurement + fix 1/2, 2026-10-28
+
+That 3/3-timeout result prompted a direct latency measurement:
+`GeneralLlm(model="gemini/gemini-3.8-flash", ...).invoke()` on the same
+one-word health-check prompt, called directly (not through the bot),
+several times in a row:
+
+| Call | Result |
+|---|---|
+| 1 | 503 ServiceUnavailable, 1.45s |
+| 2 | 503 ServiceUnavailable, 0.96s |
+| 3 | succeeded, **11.36s** |
+| 4 | **Timeout, 90.17s** (full timeout, zero response) |
+| 5 | **Timeout, 90.07s** |
+| 6 | **Timeout, 90.12s** |
+| 7 | 429 RateLimitError, 0.18s |
+
+For comparison, `gemini/gemini-3.5-flash-lite` (the parser-tier model,
+already in use): **4/4 succeeded, 0.53-0.67s** -- no variance, no errors.
+And `gemini/gemini-3.5-flash` (the new fallback candidate, see below):
+**3/3 succeeded, 1.38-2.68s** -- also solid.
+
+Also tried disabling thinking via `generationConfig.thinkingConfig.
+thinkingBudget: 0` (litellm's documented way to zero out a Gemini model's
+thinking budget) on gemini-3.8-flash specifically, hypothesizing "thinking"
+was the latency driver: made it **worse**, not better -- the one call
+tried with that config hit the full 90s timeout, whereas calls without it
+sometimes succeeded in ~11s. Gemini 3-generation models may not honor
+`thinkingBudget: 0` the way the 2.5-era ones did (litellm's own mapping
+table only has special-cased budgets for `gemini-2.5-*` substrings, which
+`gemini-3.8-flash` doesn't match) -- not pursued further since the one data
+point available argues against it, and the user's own fallback option
+(raise the timeout) doesn't carry that risk.
+
+**Conclusion**: this isn't purely "thinking is slow" -- it's a mix of (a)
+503/429 overload (already covered by the retry-allowlist fix above) and
+(b) genuine latency variance from ~1s to 90+s on the *same* trivial prompt,
+including outright multi-minute hangs with zero response that aren't
+"slow thinking that eventually answers." A 60s timeout will rescue
+borderline-slow successes (the 11.36s case was already under the old 20s
+anyway, so the real win is the broader class of 20-60s successes this
+specific run didn't happen to sample) but will NOT rescue a 90s hang --
+raising further than ~60-90s stops being a "health check" and starts being
+its own multi-minute liability per cache-miss. This is why fix 2 (below)
+carries more of the actual load-bearing improvement here.
+
+**Fix 1 implemented**: `_HEALTH_CHECK_TIMEOUT_SECONDS` raised from 20 to
+60 in `metaculus_bot/model_health.py` -- matches `GeneralLlm`'s own default
+forecast-call timeout for an unmatched model (gemini-3.8-flash doesn't
+match any entry in `GeneralLlm._defaults`, which falls through to 60s), so
+health checks now tolerate exactly what a real forecast call already
+would, no tighter. Forecast-call timeouts were already generous (60s
+default, untouched) -- this only affects the health-check path.
+
+**Fix 2 implemented**: `gemini/gemini-3.5-flash` (confirmed working above,
+not previously in the pool) added to `DEFAULT_MODEL_POOL` right after the
+two Groq models and before the OpenRouter `:free` tier. Non-openrouter, so
+`select_healthy_models` health-checks it alongside the other primaries on
+every cache-miss (not gated behind "only if the primary tier falls short,"
+unlike the OpenRouter tier) -- when gemini-3.8-flash fails, the ensemble
+now gets this same-family Gemini model ahead of jumping to OpenRouter.
+
+**Fix 3 (second Gemini model) explicitly folded into fix 2** -- the user's
+request already specified gemini-3.5-flash as *the* second model, so
+there's no separate "fix 3 skipped" here; the earlier plan's fix 3 (de-
+prioritized pending more data) is a different, still-unimplemented idea
+(an entirely independent redundant *primary* model, not a same-provider
+fallback) and remains skipped.
+
+Covered by `tests/test_config.py` (3 tests: `gemini-3.5-flash` present,
+ordered before the OpenRouter tier, and correctly classified as
+non-openrouter via `provider_of`) and `tests/test_model_health.py`'s new
+`test_check_one_uses_60s_timeout` (locks in the 60s value via a fake
+`GeneralLlm` capturing constructor kwargs). 135/135 tests pass, pyflakes
+clean.
+
+**Revised same day: reverted the 60s timeout bump, reordered the pool.**
+On reflection the 60s bump was the weaker of the two fixes anyway (see the
+"will NOT rescue a 90s hang" conclusion above) -- reverted
+`_HEALTH_CHECK_TIMEOUT_SECONDS` back to 20s rather than keep a change that
+mostly just makes each of the 3 retries individually slower (worst case
+~3x60s + backoff vs ~3x20s + backoff) without reliably helping. Instead,
+reordered `DEFAULT_MODEL_POOL` so `gemini-3.5-flash` comes *before*
+`gemini-3.8-flash` (previously added after, position 4) -- since the
+measurement showed 3.5-flash is the more reliable of the two Gemini models
+today (1.4-2.7s every time vs 3.8-flash's 90s hangs/503s/429s), it makes
+more sense as the first-tried primary than as a fallback behind an
+unreliable one. `tests/test_model_health.py::test_check_one_uses_60s_timeout`
+removed (asserted the now-reverted value); `tests/test_config.py` updated
+to assert the new order (`gemini-3.5-flash` before `gemini-3.8-flash`,
+both before the OpenRouter tier) instead. 135/135 tests still pass
+(net-zero: one test removed, one split into two), pyflakes clean.

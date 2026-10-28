@@ -13,13 +13,19 @@ from dataclasses import dataclass, field
 
 # Free-tier models across 3 real providers (Gemini, Groq, OpenRouter),
 # verified working on 2026-10-12 (see docs/STAGE_B_PLAN.md "Multi-provider
-# pool"). Priority order matters: gemini-3.8-flash and the two Groq models
-# are the primary picks (each a genuinely different company/API, not just a
-# different model on the same shared OpenRouter free pool), with the
-# OpenRouter :free pool kept purely as a fallback tier if gemini/groq are
-# both unhealthy. `model_health.select_healthy_models` now walks this list
-# in order and takes the first `target_ensemble_size` healthy entries --
-# no provider-diversity dedup, since the ordering already encodes that.
+# pool"). Priority order matters: gemini-3.5-flash, gemini-3.8-flash, and
+# the two Groq models are the primary picks (each a genuinely different
+# company/API, not just a different model on the same shared OpenRouter
+# free pool), with the OpenRouter :free pool kept purely as a last-resort
+# fallback tier if all of those are unhealthy. gemini-3.5-flash is listed
+# ahead of gemini-3.8-flash (added 2026-10-28, reordered same day) because
+# a direct latency measurement found gemini-3.8-flash hitting full 90s
+# timeouts and 503/429 errors on a trivial one-word prompt, while
+# gemini-3.5-flash answered the same prompt in 1.4-2.7s every time -- see
+# docs/STAGE_B_PLAN.md "Ensemble composition audit + Gemini reliability
+# plan". `model_health.select_healthy_models` now walks this list in order
+# and takes the first `target_ensemble_size` healthy entries -- no
+# provider-diversity dedup, since the ordering already encodes that.
 #
 # `models` is the static fallback ensemble (used only if something
 # constructs the bot without going through the health-check flow, e.g.
@@ -31,6 +37,7 @@ DEFAULT_MODELS = [
     "groq/qwen/qwen3.8-27b",
 ]
 DEFAULT_MODEL_POOL = [
+    "gemini/gemini-3.5-flash",
     "gemini/gemini-3.8-flash",
     "groq/openai/gpt-oss-120b",
     "groq/qwen/qwen3.8-27b",

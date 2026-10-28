@@ -54,6 +54,15 @@ from metaculus_bot.model_naming import provider_of
 logger = logging.getLogger(__name__)
 
 _HEALTH_CHECK_PROMPT = "Reply with exactly one word: OK"
+# Kept at 20s (considered raising to 60s on 2026-10-28, reverted): measuring
+# gemini-3.8-flash directly showed successful completions anywhere from
+# ~11s up to a full 90s timeout, but also 3 separate 90s hangs with zero
+# response and 503/429 errors -- a longer per-attempt timeout mostly just
+# makes each of the 3 retries (_HEALTH_CHECK_MAX_TRIES) individually slower
+# without reliably rescuing those hangs, so a model this unreliable is
+# better served by gemini-3.5-flash now sitting ahead of it in
+# DEFAULT_MODEL_POOL (see docs/STAGE_B_PLAN.md "Ensemble composition audit
+# + Gemini reliability plan") than by a longer timeout here.
 _HEALTH_CHECK_TIMEOUT_SECONDS = 20
 _HEALTH_CHECK_MAX_TRIES = 3  # reuses the same backoff as real forecast calls
 _HEALTH_CACHE_TTL_SECONDS = 3600
