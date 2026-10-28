@@ -6,13 +6,21 @@ question type, per-model Brier for binary questions (each model's raw,
 pre-ensemble forecast vs the actual outcome), raw-ensemble-vs-post-
 calibration Brier, and a 10-bin calibration table.
 
-Read-only: every Metaculus API call here is a GET against /api/posts/{id}/
-(never posts a prediction/comment, never submits anything). See
-docs/STAGE_B_PLAN.md "Performance report" for how the score_data schema
+Read-only against Metaculus: every API call here is a GET against
+/api/posts/{id}/ (never posts a prediction/comment, never submits anything).
+See docs/STAGE_B_PLAN.md "Performance report" for how the score_data schema
 below was determined -- Metaculus's REST API doesn't document it, but their
 open-source webapp's docs/openapi.yml does (score_data keys: peer_score,
 baseline_score, spot_peer_score, spot_baseline_score, coverage, and
 *_archived_score variants).
+
+Not read-only against our own DB: every resolved binary question also gets
+its raw (pre-calibration) ensemble probability + outcome logged to the
+`resolutions` table via db.record_resolution -- pure logging for a future
+calibration check, no correction applied anywhere yet. See
+docs/STAGE_B_PLAN.md "Calibration tracking". The caller is responsible for
+persisting the DB afterward if those writes need to survive (e.g.
+weekly_summary.yaml's persist-data-branch step).
 
 Usage:
     poetry run python scripts/performance_report.py [--db-path data/forecasts.db]
@@ -282,6 +290,18 @@ def generate_report(conn: sqlite3.Connection, token: str | None) -> str:
         post_calibration_value = _parse_logged_value(row["post_calibration_value"])
         if aggregate_value is not None:
             ensemble_pairs.append((aggregate_value, outcome))
+            # Tracking only -- no correction applied anywhere yet. Once
+            # this crosses ~30 rows we can test whether raw ensemble
+            # probabilities are systematically underconfident (a
+            # calibration constant k > 1 in p' = sigmoid(k * logit(p))).
+            # See docs/STAGE_B_PLAN.md "Calibration tracking".
+            db.record_resolution(
+                conn,
+                question_id=row["question_id"],
+                resolved_at=qjson.get("question", {}).get("actual_resolve_time"),
+                resolution_value=qjson.get("question", {}).get("resolution"),
+                raw_ensemble_prob=aggregate_value,
+            )
         if post_calibration_value is not None:
             calibrated_pairs.append((post_calibration_value, outcome))
 
@@ -302,8 +322,12 @@ def generate_report(conn: sqlite3.Connection, token: str | None) -> str:
                 continue
             per_model_pairs.setdefault(entry["model"], []).append((value, outcome))
 
+    tracked = db.count_tracked_binary_resolutions(conn)
+    ready_note = " -- ready to test calibration (k-factor)" if tracked >= 30 else f" ({max(30 - tracked, 0)} more until ~30)"
+    lines.append(f"\nCalibration tracking: {tracked} resolved binary question(s) logged (raw prob vs outcome){ready_note}.")
+
     if not calibrated_pairs and not ensemble_pairs:
-        lines.append("\nNo resolved binary questions yet for Brier/calibration analysis.")
+        lines.append("No resolved binary questions yet for Brier/calibration analysis.")
         return "\n".join(lines)
 
     lines.append(f"\nBinary questions resolved (local analysis): {len(calibrated_pairs)}")

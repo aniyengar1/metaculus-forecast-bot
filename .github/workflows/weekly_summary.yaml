@@ -9,14 +9,28 @@ name: Weekly Summary
 # and the backup-poller health section (scripts/dispatch_health.py) reads
 # this repo's own Actions run history via the built-in GITHUB_TOKEN --
 # hence `actions: read` below. See docs/STAGE_B_PLAN.md "Backup poller".
+#
+# One write side effect: the performance report section also logs each
+# newly-resolved binary question's raw ensemble probability + outcome to
+# the local `resolutions` table (pure tracking for a future calibration
+# check -- see docs/STAGE_B_PLAN.md "Calibration tracking"), so this
+# workflow persists the DB back to the `data` branch afterward -- hence
+# `contents: write` below, previously just `read`. Shares the same
+# concurrency group as the two forecast workflows (not the default ${{
+# github.workflow }}) so that persist can never race theirs on the `data`
+# branch -- whichever triggers second just queues instead of overlapping.
 
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 9 * * 1" # Monday 09:00 UTC
 
+concurrency:
+  group: metaculus-bot-forecast
+  cancel-in-progress: false
+
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 jobs:
@@ -35,7 +49,7 @@ jobs:
           virtualenvs-in-project: true
           installer-parallel: true
       - name: Install dependencies
-        run: poetry install --no-interaction --no-root
+        run: bash scripts/install_dependencies_with_retry.sh
       - name: Restore forecast DB from data branch
         run: bash scripts/restore_data_branch.sh
       - name: Print weekly summary
@@ -44,3 +58,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           METACULUS_DISPATCH_PAT_EXPIRES: ${{ vars.METACULUS_DISPATCH_PAT_EXPIRES }}
         run: poetry run python scripts/weekly_summary.py --days 7
+      - name: Persist forecast DB to data branch
+        run: bash scripts/persist_data_branch.sh

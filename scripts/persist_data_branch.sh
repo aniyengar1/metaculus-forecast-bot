@@ -36,7 +36,28 @@ cp "$DB_PATH" "$WORKTREE_DIR/$DB_PATH"
         echo "No changes to $DB_PATH, nothing to commit."
     else
         git commit --quiet -m "Update forecast DB [skip ci]"
-        git push origin data
+        # Retry once on push rejection (e.g. another run pushed a newer
+        # commit in between our fetch and our push -- the shared
+        # concurrency group on the forecast workflows makes this unlikely
+        # but not impossible at the exact boundary between a queued run
+        # finishing and the next starting). Rebase onto the freshly
+        # fetched tip before retrying -- if that itself conflicts (two
+        # genuinely different versions of the binary db file), bail out
+        # loudly rather than guessing how to resolve it.
+        if ! git push origin data; then
+            echo "git push to data branch failed -- fetching and rebasing before one retry."
+            set +e
+            git fetch origin data --quiet
+            git rebase origin/data
+            rebase_status=$?
+            set -e
+            if [ "$rebase_status" -ne 0 ]; then
+                git rebase --abort >/dev/null 2>&1 || true
+                echo "Rebase onto origin/data failed (likely a genuine conflict on the binary db file) -- giving up." >&2
+                exit 1
+            fi
+            git push origin data
+        fi
         echo "Pushed updated $DB_PATH to the data branch."
     fi
 )

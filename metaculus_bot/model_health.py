@@ -27,13 +27,16 @@ whole time and never actually needed the fallback:
 1. The OpenRouter fallback tier (any model whose provider_of() returns
    "openrouter") is only health-checked at all if the primary
    (non-OpenRouter) models don't already satisfy target_count.
-2. Every health check result (primary or fallback) is cached in SQLite for
-   1 hour (metaculus_bot.db.get_cached_model_health/set_cached_model_health)
-   -- a model doesn't get re-pinged more than once per hour regardless of
-   how often the bot itself runs.
+2. Every health check result (primary or fallback) is cached in SQLite
+   (metaculus_bot.db.get_cached_model_health/set_cached_model_health) --
+   a healthy verdict for 1 hour, an unhealthy one for only 5 minutes (see
+   _HEALTH_CACHE_NEGATIVE_TTL_SECONDS below) -- so a model doesn't get
+   re-pinged needlessly often when healthy, but a transient blip doesn't
+   lock it out of the ensemble for a full hour either.
 
-See docs/STAGE_B_PLAN.md "OpenRouter health-check quota drain" for the
-measured before/after numbers.
+See docs/STAGE_B_PLAN.md "OpenRouter health-check quota drain" and
+"Ensemble composition audit + Gemini reliability plan" for the measured
+before/after numbers.
 """
 from __future__ import annotations
 
@@ -54,6 +57,13 @@ _HEALTH_CHECK_PROMPT = "Reply with exactly one word: OK"
 _HEALTH_CHECK_TIMEOUT_SECONDS = 20
 _HEALTH_CHECK_MAX_TRIES = 3  # reuses the same backoff as real forecast calls
 _HEALTH_CACHE_TTL_SECONDS = 3600
+# Deliberately much shorter than the healthy TTL: a 2026-10-27 audit found
+# Gemini missing from ~70% of eligible ensembles, almost entirely
+# single-timestamp 503/500/Timeout blips rather than sustained outages (see
+# docs/STAGE_B_PLAN.md "Ensemble composition audit + Gemini reliability
+# plan") -- caching "dead" for the same 1h as "healthy" needlessly keeps a
+# model out of every run in that window even after it's recovered.
+_HEALTH_CACHE_NEGATIVE_TTL_SECONDS = 300
 
 
 @dataclass
@@ -83,7 +93,12 @@ async def _check_models_cached(conn: sqlite3.Connection, models: list[str]) -> d
     results: dict[str, HealthResult] = {}
     to_check: list[str] = []
     for model in models:
-        cached = db.get_cached_model_health(conn, model, _HEALTH_CACHE_TTL_SECONDS)
+        cached = db.get_cached_model_health(
+            conn,
+            model,
+            healthy_ttl_seconds=_HEALTH_CACHE_TTL_SECONDS,
+            unhealthy_ttl_seconds=_HEALTH_CACHE_NEGATIVE_TTL_SECONDS,
+        )
         if cached is not None:
             healthy, error = cached
             results[model] = HealthResult(model=model, healthy=healthy, error=error)

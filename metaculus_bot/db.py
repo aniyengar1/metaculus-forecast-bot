@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS resolutions (
     resolved_at TEXT,
     resolution_value TEXT,
     brier_score REAL,
-    log_score REAL
+    log_score REAL,
+    raw_ensemble_prob REAL
 );
 
 CREATE TABLE IF NOT EXISTS asknews_usage (
@@ -94,21 +95,30 @@ CREATE TABLE IF NOT EXISTS model_health_cache (
 """
 
 
-# Columns added after the `forecasts` table's first release. CREATE TABLE IF
-# NOT EXISTS is a no-op against an already-existing table (e.g. the
-# persisted data-branch DB from earlier runs), so new columns need an
-# explicit migration rather than just appearing in SCHEMA above.
+# Columns added after a table's first release. CREATE TABLE IF NOT EXISTS is
+# a no-op against an already-existing table (e.g. the persisted data-branch
+# DB from earlier runs), so new columns need an explicit migration rather
+# than just appearing in SCHEMA above.
 _FORECASTS_TABLE_MIGRATIONS = [
     ("estimated_cost_usd", "REAL"),
     ("tournament", "TEXT"),
 ]
 
+_RESOLUTIONS_TABLE_MIGRATIONS = [
+    ("raw_ensemble_prob", "REAL"),
+]
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table: str, migrations: list[tuple[str, str]]) -> None:
+    existing_columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for column, sql_type in migrations:
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(forecasts)")}
-    for column, sql_type in _FORECASTS_TABLE_MIGRATIONS:
-        if column not in existing_columns:
-            conn.execute(f"ALTER TABLE forecasts ADD COLUMN {column} {sql_type}")
+    _add_missing_columns(conn, "forecasts", _FORECASTS_TABLE_MIGRATIONS)
+    _add_missing_columns(conn, "resolutions", _RESOLUTIONS_TABLE_MIGRATIONS)
     conn.commit()
 
 
@@ -351,23 +361,30 @@ def set_cached_model_health(conn: sqlite3.Connection, model: str, healthy: bool,
 
 
 def get_cached_model_health(
-    conn: sqlite3.Connection, model: str, max_age_seconds: int
+    conn: sqlite3.Connection, model: str, *, healthy_ttl_seconds: int, unhealthy_ttl_seconds: int
 ) -> tuple[bool, str | None] | None:
     """Returns (healthy, error) if a health check for this model was cached
-    within the last `max_age_seconds`, else None (caller should check
-    fresh). See metaculus_bot/model_health.py -- this is what stops the
+    recently enough, else None (caller should check fresh). Which TTL
+    applies depends on the *cached* verdict: `unhealthy_ttl_seconds` is
+    deliberately shorter than `healthy_ttl_seconds` -- a 2026-10-27 audit
+    found Gemini outages are short-lived (single-timestamp 503/500/Timeout
+    blips, not sustained), so caching "dead" for a full hour needlessly
+    drops it from every run in that window even after it's recovered. See
+    metaculus_bot/model_health.py -- this is also what stops the
     OpenRouter fallback tier (and everything else) from being re-pinged on
-    every single run."""
+    every single run when healthy."""
     row = conn.execute(
         "SELECT healthy, error, checked_at FROM model_health_cache WHERE model = ?", (model,)
     ).fetchone()
     if not row:
         return None
+    healthy = bool(row[0])
+    ttl = healthy_ttl_seconds if healthy else unhealthy_ttl_seconds
     checked_at = datetime.fromisoformat(row[2])
     age_seconds = (datetime.now(timezone.utc) - checked_at).total_seconds()
-    if age_seconds > max_age_seconds:
+    if age_seconds > ttl:
         return None
-    return bool(row[0]), row[1]
+    return healthy, row[1]
 
 
 def get_last_forecast_time(conn: sqlite3.Connection, question_id: int) -> datetime | None:
@@ -408,6 +425,41 @@ def latest_forecasts_per_question(conn: sqlite3.Connection, *, dry_run: bool | N
         """
     ).fetchall()
     return rows
+
+
+def record_resolution(
+    conn: sqlite3.Connection,
+    *,
+    question_id: int,
+    resolved_at: str | None,
+    resolution_value: str | None,
+    raw_ensemble_prob: float,
+) -> None:
+    """Logs a resolved binary question's raw (pre-calibration) ensemble
+    probability alongside the eventual outcome, purely for later analysis --
+    no correction is applied anywhere based on this yet. Idempotent: a
+    question's resolution never changes once set, so re-running this on an
+    already-recorded question just overwrites it with the same values. See
+    docs/STAGE_B_PLAN.md "Calibration tracking"."""
+    conn.execute(
+        """
+        INSERT INTO resolutions (question_id, resolved_at, resolution_value, raw_ensemble_prob)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(question_id) DO UPDATE SET
+            resolved_at = excluded.resolved_at,
+            resolution_value = excluded.resolution_value,
+            raw_ensemble_prob = excluded.raw_ensemble_prob
+        """,
+        (question_id, resolved_at, resolution_value, raw_ensemble_prob),
+    )
+    conn.commit()
+
+
+def count_tracked_binary_resolutions(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM resolutions WHERE raw_ensemble_prob IS NOT NULL"
+    ).fetchone()
+    return int(row[0] or 0)
 
 
 def count_reforecasts_today(conn: sqlite3.Connection) -> int:

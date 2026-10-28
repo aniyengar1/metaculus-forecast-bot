@@ -781,3 +781,251 @@ found**:
    `failure` conclusion; the cancelled run (08:39:41-08:40:05 UTC)
    produced zero notification entries. Cancelled runs do not trigger
    failure emails/notifications for this account.
+
+## Single poetry-install failure, 2026-10-20 -- and transient vs genuine failure classification
+
+A GitHub failure email arrived ~a day after `7e5db46`. Audited the full 48h
+window across all workflows (`gh run list --limit 500` -- `--limit 100`
+silently truncates; expected ~288 runs/48h at the 10-min cadence, so always
+confirm the earliest fetched timestamp is `<=` the cutoff before trusting a
+count).
+
+**Counts (48h):**
+
+- **MiniBench** (`run_bot_on_minibench.yaml`): 1 failure / ~148 successes.
+- **Seasonal** (`run_bot_on_seasonal.yaml`): 1 failure / ~149 successes, plus
+  2 cancelled (benign concurrency-supersede artifacts, no failure email -- see
+  the 2026-10-19 note above).
+- All other workflows: 0 failures.
+
+Of the two failures, the MiniBench one and 18 others in the broader lookback
+were the **already-fixed** 2026-10-19 rate-limit-guard incident (identical
+`🚨 REFUSING TO START: Only N OpenRouter free-model request(s) left...`
+message, all predating `af2ecc7`). Exactly **one** failure was new and
+unexplained:
+
+**Root cause -- seasonal run `39352376434` (2026-10-20T01:15:03Z):** failed
+inside the `Install dependencies` (`poetry install`) step, *before* `main.py`
+ran at all:
+
+```
+ChunkedEncodingError('Connection broken: IncompleteRead(3373544 bytes read,
+1511268 more expected)') ... Cannot install jedi.
+```
+
+A transient network blip mid-download of a wheel. Nothing to do with our code,
+Metaculus, or any LLM provider. Confirmed still `Image: ubuntu-24.04` (not the
+Ubuntu migration). (`gh run view --log-failed`'s TSV step column said
+"UNKNOWN STEP" for every line -- a `gh` CLI quirk; read the raw log directly,
+the embedded `poetry install` command block and its failure are unambiguous.)
+
+**No question missed.** The failed seasonal tick made zero forecasts (it died
+before fetching anything), but it was bracketed by **successful** full-cycle
+seasonal runs at 01:05:02Z and 01:25:02Z -- 10 minutes on either side -- each
+of which fetches the complete open-question list and forecasts every new one.
+A question open at 01:15 was necessarily open (and handled) at both 01:05 and
+01:25; the only miss possible would be a question that both opened *and* closed
+inside a 20-minute window, which doesn't happen for tournament questions.
+MiniBench was 100% successful throughout the same window (ticks at 01:10 and
+01:20 both succeeded), so there was no correlated outage either.
+
+**Three-part fix** (transient failures made non-fatal where safe; genuine
+breakage still fails loudly):
+
+1. **`scripts/install_dependencies_with_retry.sh`** (new): retries
+   `poetry install` up to 3x with a 10s gap, forwarding extra args via `"$@"`
+   so `review_bot.yaml`'s `--with integrations` still works. Still exits 1 (and
+   fails the run) if all 3 attempts fail -- a persistently broken install is a
+   real problem, not a blip. Wired into all 5 workflows that run
+   `poetry install` (minibench, seasonal, weekly_summary, test_bot, review_bot).
+
+2. **`scripts/persist_data_branch.sh`**: the `git push origin data` now retries
+   once on rejection, fetching and rebasing onto the fresh tip first (a push
+   race between a finishing queued run and the next one starting -- unlikely
+   given the shared concurrency group, but possible at the exact boundary). If
+   the rebase itself conflicts (two genuinely different versions of the binary
+   SQLite file -- git can't 3-way-merge it), it aborts the rebase and exits 1
+   loudly rather than guessing a resolution.
+
+3. **`metaculus_bot/transient_errors.py`** (new) +
+   `main.py`: `is_transient_provider_or_metaculus_error` classifies an
+   exception against a deliberately conservative allowlist -- litellm
+   `RateLimitError`/`ServiceUnavailableError`/`Timeout`/`APIConnectionError`/
+   `InternalServerError`/`BadGatewayError`, `requests` connection/timeout
+   errors, and `HTTPError` with status in {429, 500, 502, 503, 504}. Everything
+   else (auth errors, 404 "model not found", `AttributeError`, `TypeError`,
+   ...) returns `False`. `main.py` wraps the previously-unprotected
+   question-fetching section: a transient blip there logs an alert and
+   `return 0` (the run becomes a no-op, not a failure email), while a genuine
+   error logs an alert **and re-raises** so the run still fails. Covered by
+   `tests/test_transient_errors.py` (13 cases on the classifier) and
+   `tests/test_fetch_questions_transient.py` (3 cases exercising the `_run()`
+   wiring end-to-end: transient -> alert + exit 0; auth error -> alert +
+   re-raise; generic bug -> alert + re-raise).
+
+**Why swallow transient but not genuine:** a one-off provider/network blip is
+very likely to succeed on its own on the next ~10-min tick without anyone doing
+anything, so crashing and emailing a failure for it is pure noise. But silently
+swallowing a real bug (a refactor's `AttributeError`, an expired API key, every
+model down) is strictly worse than one noisy email -- so the default for
+anything not on the explicit transient allowlist is to fail loudly.
+
+## Ensemble composition audit + Gemini reliability plan + calibration tracking, 2026-10-27
+
+**1. Ensemble composition, all 100 `ok` forecasts to date:**
+
+| Model | Times in ensemble |
+|---|---|
+| `groq/openai/gpt-oss-120b` | 94 |
+| `groq/qwen/qwen3.8-27b` | 92 |
+| `openrouter/nvidia/nemotron-3-super-120b-a12b:free` | 40 |
+| `openrouter/dots-studio/dots-3-note-preview:free` | 38 |
+| `gemini/gemini-3.8-flash` | 28 |
+| `openrouter/apodex/apodex-1.1-mini:free` | 6 |
+
+Ensemble size: 98/100 used 3 models, 2/100 used 2 models, 0/100 used 1 (the
+<2 abort in `main.py` has never fired). The two 2-model forecasts (ids 68,
+69) happened when `gpt-oss-120b` + `dots-3-note-preview` were the only
+healthy primaries and the OpenRouter fallback's other candidates were also
+down that hour.
+
+**Gemini specifically**: present in only 28/94 eligible forecasts (30%) --
+eligible meaning `run_timestamp >= 2026-10-12T19:17:58Z`, when `f2c30ed`
+first added Gemini to the pool (the 6 earliest forecasts predate that and
+don't count as "missing", Gemini simply wasn't in the pool yet). Clustering
+the 66 missing instances by the 1h health-check-cache TTL yields **42
+distinct incidents** over 15 days (~2.8/day) -- mostly isolated, not one
+long outage.
+
+Sampled 3 incidents' actual GH Actions logs (`gh run view --log-failed`,
+reading the `metaculus_bot.model_health` WARNING line) for the real error:
+
+| Date | Error |
+|---|---|
+| 2026-10-13T17:11 | `InternalServerError` (Gemini 500) |
+| 2026-10-19T02:31 | `Timeout` (20s health-check timeout hit) |
+| 2026-10-20T01:12 | `Timeout` (20s health-check timeout hit) |
+| 2026-10-27T15:06 (today) | `ServiceUnavailableError` (Gemini 503 "high demand") |
+
+Zero `RateLimitError` (429) samples -- expected, since 429 is the *only*
+error type `llm_retry.invoke_with_backoff` already retries; it wouldn't
+normally surface as "missing" in the first place. Notably, on both the
+2026-10-13 and 2026-10-27 samples, `gemini/gemini-3.8-flash` (primary) AND
+`gemini/gemini-3.5-flash-lite` (parser-tier, a *different* Gemini model)
+failed in the same run -- evidence the outages are account/backend-level,
+not specific to one model.
+
+**2. Root cause + proposed fix (not implemented yet):**
+
+`metaculus_bot/llm_retry.py`'s `invoke_with_backoff` only retries
+`litellm.RateLimitError`. `ServiceUnavailableError`, `InternalServerError`,
+and `Timeout` -- the three error types actually observed above -- propagate
+immediately with zero retry, so a transient few-second Gemini blip
+instantly drops it from that run's ensemble, and the 1h health-check cache
+(see "OpenRouter health-check quota drain" above) then keeps it dropped for
+up to an hour afterward even if it would have recovered in seconds.
+
+Proposed, in priority order:
+
+1. **Extend the retry allowlist** in `invoke_with_backoff` to also cover
+   `ServiceUnavailableError`, `InternalServerError`, and `Timeout` with the
+   same exponential backoff already used for 429. Biggest, cheapest win --
+   one shared function already used by both health checks and real
+   forecast calls, so real mid-run forecast calls hitting the same errors
+   benefit too, not just the health-check step.
+2. **Shorten the negative-result cache TTL.** `model_health_cache` caches
+   both healthy *and* unhealthy verdicts for the same 1h
+   (`_HEALTH_CACHE_TTL_SECONDS`). All 3 sampled incidents were single-
+   timestamp blips, not sustained outages, so a model that fails even after
+   (1)'s retries is likely fine again within minutes -- caching that
+   "dead" for a full hour needlessly degrades every run in that window.
+   Proposal: keep 1h for `healthy=True`, drop to ~5-10 min for
+   `healthy=False`.
+3. **(Lower priority) second Gemini model as backup.** Explicitly
+   de-prioritized: the correlated gemini-3.8-flash + gemini-3.5-flash-lite
+   failures in 2/3 samples suggest outages hit the Gemini backend/account
+   as a whole, not one model -- a second Gemini model would likely degrade
+   at the same time for the same reason. Worth revisiting only if (1)+(2)
+   don't move the needle after a couple more weeks of data.
+
+**3. Calibration tracking (logging only, no correction applied) -- added
+this round:**
+
+`scripts/performance_report.py` already recomputes a raw-ensemble-vs-
+outcome calibration table from live API data on every run, but never
+persisted it -- re-running the report from scratch is the only way to see
+it, and nothing survives between runs. Added:
+
+- `resolutions` table gets a new `raw_ensemble_prob REAL` column
+  (migration in `metaculus_bot/db.py`, since `CREATE TABLE IF NOT EXISTS`
+  is a no-op against the already-existing table on the `data` branch).
+- `db.record_resolution()`: idempotent upsert of
+  (question_id, resolved_at, resolution_value, raw_ensemble_prob) --
+  called from `performance_report.py`'s existing per-question loop
+  (piggybacks on API calls it already makes; no extra Metaculus requests).
+  Deliberately logs the **raw, pre-calibration** `aggregate_value`, not
+  `post_calibration_value` -- the whole point is to later test whether the
+  *raw* ensemble is systematically underconfident, which post-calibration
+  values would already mask.
+- `db.count_tracked_binary_resolutions()` + a new report line:
+  `Calibration tracking: N resolved binary question(s) logged ... (M more
+  until ~30)`, so progress toward a large-enough sample is visible every
+  week without a separate query.
+- `weekly_summary.yaml` now persists `data/forecasts.db` back to the `data`
+  branch after the report runs (previously pure read-only, `contents:
+  read`; now `contents: write` + a `persist_data_branch.sh` step) --
+  without this the new tracked rows would be silently discarded at the end
+  of every weekly job.
+- Covered by `tests/test_db.py` (migration against a pre-existing table,
+  upsert idempotency, count) and an extended
+  `tests/test_performance_report.py::test_generate_report_end_to_end`
+  (asserts the tracked row's `raw_ensemble_prob` is the pre-calibration
+  0.6, not the post-calibration 0.55).
+
+Checked the current count against the live API (slowed
+`fetch_question_json`'s request interval to 1.5s to avoid the 429s a
+back-to-back run hits -- see that function's own docstring): **1** resolved
++ scored binary question so far (the Boeing 737 MAX 10 one, peer score
+-3.32 -- see the prior section). Far from 30, so tracking starting now,
+before volume picks up, is the right time; no calibration correction is
+implied or applied by this change.
+
+**Gemini reliability fixes 1+2, implemented same day (fix 3, a second
+Gemini model, explicitly skipped per the plan above):**
+
+- `metaculus_bot/llm_retry.py`: `invoke_with_backoff`'s retry allowlist
+  extended from just `litellm.RateLimitError` to also cover
+  `ServiceUnavailableError`, `InternalServerError`, and `Timeout` -- the
+  exact three error types the audit's samples hit, all previously
+  propagated with zero retry. Same exponential backoff (2s, 4s), same
+  `max_tries=3` default, shared by both the health-checker and real
+  forecast calls -- a mid-run forecast call hitting a 503 now also
+  benefits, not just the health-check step. Covered by new
+  `tests/test_llm_retry.py` (each allowlisted exception type retries then
+  succeeds; exhausting all tries re-raises; a non-retryable exception like
+  `AuthenticationError` still propagates immediately on the first try;
+  backoff timing is exactly 2s/4s between 3 attempts).
+- `metaculus_bot/model_health.py` / `metaculus_bot/db.py`:
+  `get_cached_model_health`'s single `max_age_seconds` split into
+  `healthy_ttl_seconds` (kept at 1h) and `unhealthy_ttl_seconds` (new,
+  300s/5min) -- which applies depends on the *cached verdict*, not the
+  caller, since you don't know which TTL to ask for until you've read the
+  row. A model that fails health-checking (even after fix 1's retries) no
+  longer stays "dead" for a full hour; it's re-checked after 5 minutes.
+  Covered by extending `tests/test_model_health.py` (roundtrip test
+  updated for the new keyword args; new test confirms a cached-unhealthy
+  entry 6 minutes old is treated as stale while a cached-healthy entry the
+  same age would not be).
+- `.github/workflows/weekly_summary.yaml` also joined the
+  `metaculus-bot-forecast` concurrency group (previously
+  `${{ github.workflow }}`, i.e. its own private group) -- now that it
+  writes to the `data` branch too (see "Calibration tracking" above), it
+  needs to queue behind/ahead of the two forecast workflows rather than
+  risk racing them on the same branch push.
+
+Verified: 131/131 tests pass (18 new this round: 7 in `test_llm_retry.py`,
+2 updated + 1 new in `test_model_health.py`, plus the `test_db.py`/
+`test_performance_report.py` additions from the calibration-tracking work
+above), pyflakes clean, all 3 touched workflow YAML files parse. Next
+step: confirm the next MiniBench + seasonal runs still pass post-push, then
+check back in ~24h on how often Gemini actually makes the ensemble now.

@@ -121,19 +121,37 @@ def test_health_result_rechecked_after_ttl_expires(monkeypatch):
 
 def test_get_cached_model_health_roundtrip():
     conn = _conn()
-    assert db.get_cached_model_health(conn, "m1", max_age_seconds=3600) is None
+    assert db.get_cached_model_health(conn, "m1", healthy_ttl_seconds=3600, unhealthy_ttl_seconds=300) is None
 
     db.set_cached_model_health(conn, "m1", True, None)
-    assert db.get_cached_model_health(conn, "m1", max_age_seconds=3600) == (True, None)
+    assert db.get_cached_model_health(conn, "m1", healthy_ttl_seconds=3600, unhealthy_ttl_seconds=300) == (True, None)
 
     db.set_cached_model_health(conn, "m1", False, "RateLimitError: x")
-    assert db.get_cached_model_health(conn, "m1", max_age_seconds=3600) == (False, "RateLimitError: x")
+    assert db.get_cached_model_health(conn, "m1", healthy_ttl_seconds=3600, unhealthy_ttl_seconds=300) == (
+        False,
+        "RateLimitError: x",
+    )
 
 
-def test_get_cached_model_health_respects_max_age():
+def test_get_cached_model_health_respects_healthy_ttl():
     conn = _conn()
     db.set_cached_model_health(conn, "m1", True, None)
     stale_time = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
     conn.execute("UPDATE model_health_cache SET checked_at = ? WHERE model = ?", (stale_time, "m1"))
     conn.commit()
-    assert db.get_cached_model_health(conn, "m1", max_age_seconds=3600) is None
+    assert db.get_cached_model_health(conn, "m1", healthy_ttl_seconds=3600, unhealthy_ttl_seconds=300) is None
+
+
+def test_get_cached_model_health_unhealthy_ttl_is_shorter_than_healthy():
+    """The actual fix: an unhealthy verdict expires much sooner than a
+    healthy one, so a transient blip doesn't lock a model out for a full
+    hour -- see docs/STAGE_B_PLAN.md "Ensemble composition audit + Gemini
+    reliability plan"."""
+    conn = _conn()
+    db.set_cached_model_health(conn, "m1", False, "ServiceUnavailableError: x")
+    age_6_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
+    conn.execute("UPDATE model_health_cache SET checked_at = ? WHERE model = ?", (age_6_minutes_ago, "m1"))
+    conn.commit()
+
+    # Still well within the 1h healthy TTL, but past the 5-min unhealthy TTL.
+    assert db.get_cached_model_health(conn, "m1", healthy_ttl_seconds=3600, unhealthy_ttl_seconds=300) is None

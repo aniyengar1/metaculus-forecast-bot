@@ -41,6 +41,7 @@ from metaculus_bot.provider_quota import (  # noqa: E402
     compute_daily_question_budget,
     split_real_and_estimated_cost,
 )
+from metaculus_bot.transient_errors import is_transient_provider_or_metaculus_error  # noqa: E402
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
@@ -262,21 +263,43 @@ async def _run(args: argparse.Namespace) -> int:
             tournament_label = args.target  # "seasonal" | "minibench" | "both"
 
         client = MetaculusClient()
-        if args.post_ids:
-            ids = [int(x.strip()) for x in args.post_ids.split(",") if x.strip()]
-            questions = [client.get_question_by_post_id(pid) for pid in ids]
-            # The normal fetch path (_fetch_questions) already decides
-            # per-tournament what to do with already-forecasted questions
-            # (drop for MiniBench, maybe re-forecast for seasonal); the
-            # --post-ids bypass doesn't go through that, so apply the simple
-            # (non-reforecasting) rule here as a safety net.
-            if args.mode != "test_questions":
-                for q in questions:
-                    if q.already_forecasted:
-                        db.mark_question_forecasted(conn, q.id_of_question)
-                questions = [q for q in questions if not q.already_forecasted]
-        else:
-            questions = await _fetch_questions(client, args.mode, args.target, cfg, conn)
+        # Fetching can raise after the SDK's own retry-with-backoff is
+        # exhausted (a prolonged Metaculus blip) -- nothing before this
+        # point catches that, so an unhandled exception here used to crash
+        # the whole run and send a failure email even for a one-off outage
+        # that would have succeeded on the very next scheduled/dispatched
+        # tick a few minutes later. See docs/STAGE_B_PLAN.md "Transient vs
+        # genuine failure classification".
+        try:
+            if args.post_ids:
+                ids = [int(x.strip()) for x in args.post_ids.split(",") if x.strip()]
+                questions = [client.get_question_by_post_id(pid) for pid in ids]
+                # The normal fetch path (_fetch_questions) already decides
+                # per-tournament what to do with already-forecasted
+                # questions (drop for MiniBench, maybe re-forecast for
+                # seasonal); the --post-ids bypass doesn't go through
+                # that, so apply the simple (non-reforecasting) rule here
+                # as a safety net.
+                if args.mode != "test_questions":
+                    for q in questions:
+                        if q.already_forecasted:
+                            db.mark_question_forecasted(conn, q.id_of_question)
+                    questions = [q for q in questions if not q.already_forecasted]
+            else:
+                questions = await _fetch_questions(client, args.mode, args.target, cfg, conn)
+        except Exception as e:
+            if is_transient_provider_or_metaculus_error(e):
+                alert_msg = (
+                    f"Transient error fetching questions ({type(e).__name__}): {e} -- "
+                    "treating as a one-off blip, not failing the run."
+                )
+                logger.warning(alert_msg)
+                db.log_alert(conn, alert_msg)
+                return 0
+            alert_msg = f"Non-transient error fetching questions, failing the run: {type(e).__name__}: {e}"
+            logger.error(alert_msg)
+            db.log_alert(conn, alert_msg)
+            raise
 
         # Log every open question we've ever seen (independent of whether we
         # forecast it *this* run) so we can tell, on a later run, whether one

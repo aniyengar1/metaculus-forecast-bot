@@ -251,6 +251,12 @@ def test_generate_report_end_to_end(monkeypatch):
     assert "Raw ensemble Brier" in report
     assert "Post-calibration Brier" in report
     assert "community prediction at forecast time" in report
+    assert "Calibration tracking: 1 resolved binary question(s) logged" in report
+
+    tracked = conn.execute(
+        "SELECT resolution_value, raw_ensemble_prob FROM resolutions WHERE question_id = 1"
+    ).fetchone()
+    assert tuple(tracked) == ("yes", 0.6)  # raw (pre-calibration) aggregate_value, not post_calibration_value's 0.55
 
 
 def test_generate_report_skips_dry_run_for_official_score_but_not_local_brier(monkeypatch):
