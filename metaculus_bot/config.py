@@ -11,45 +11,50 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-# Free-tier models across 3 real providers (Gemini, Groq, OpenRouter),
-# verified working on 2026-10-12 (see docs/STAGE_B_PLAN.md "Multi-provider
-# pool"). Priority order matters: gemini-3.5-flash, gemini-3.8-flash, and
-# the two Groq models are the primary picks (each a genuinely different
-# company/API, not just a different model on the same shared OpenRouter
-# free pool), with the OpenRouter :free pool kept purely as a last-resort
-# fallback tier if all of those are unhealthy. gemini-3.5-flash is listed
-# ahead of gemini-3.8-flash (added 2026-10-28, reordered same day) because
-# a direct latency measurement found gemini-3.8-flash hitting full 90s
-# timeouts and 503/429 errors on a trivial one-word prompt, while
-# gemini-3.5-flash answered the same prompt in 1.4-2.7s every time -- see
-# docs/STAGE_B_PLAN.md "Ensemble composition audit + Gemini reliability
-# plan". `model_health.select_healthy_models` now walks this list in order
-# and takes the first `target_ensemble_size` healthy entries -- no
-# provider-diversity dedup, since the ordering already encodes that.
+# Slot-based ensemble selection, replacing the old flat priority list
+# 2026-10-30: that flat list (gemini-3.5-flash, gemini-3.8-flash, then the
+# two Groq models) meant a fully healthy run selected the first 3 entries
+# in order -- both Gemini models -- and dropped qwen3.8-27b entirely,
+# losing provider diversity for no reason (3.8-flash and qwen weren't
+# unhealthy, they just lost a race to be "first N in the list"). Each
+# ensemble "slot" below now gets exactly one model: the slot's own
+# candidate(s) in preference order, falling back to the OpenRouter :free
+# pool only if every candidate for that specific slot is unhealthy. A
+# fully healthy run now always yields exactly {one Gemini model, gpt-oss-
+# 120b, qwen3.8-27b} -- never two Gemini models, never a dropped Groq
+# model. See docs/STAGE_B_PLAN.md "Slot-based model selection" and
+# metaculus_bot.model_health.select_ensemble_by_slot.
 #
-# `models` is the static fallback ensemble (used only if something
-# constructs the bot without going through the health-check flow, e.g.
-# tests). The real run path (main.py) always health-checks `model_pool` at
-# startup and substitutes whichever N come back healthy.
-DEFAULT_MODELS = [
-    "gemini/gemini-3.8-flash",
-    "groq/openai/gpt-oss-120b",
-    "groq/qwen/qwen3.8-27b",
-]
-DEFAULT_MODEL_POOL = [
-    "gemini/gemini-3.5-flash",
-    "gemini/gemini-3.8-flash",
-    "groq/openai/gpt-oss-120b",
-    "groq/qwen/qwen3.8-27b",
-    # OpenRouter :free fallback tier -- only reached if gemini/groq are both
-    # unhealthy. Free-tier availability churns fast there (two different
-    # models broke in two different ways within 48h on 2026-10-05/06: one
-    # rate-limited, one permanently retired/paywalled), hence several
-    # candidates rather than one.
+# Gemini slot: 3.8-flash preferred (the stronger model), 3.5-flash as same-
+# family fallback if 3.8-flash alone is unhealthy -- previously (2026-10-28)
+# 3.5-flash was promoted ahead of 3.8-flash in the old flat list specifically
+# to work around the "two Gemini models fill the ensemble" bug; now that the
+# slot structure fixes that bug directly, 3.8-flash can go back to being
+# preferred within its own slot without that side effect.
+DEFAULT_GEMINI_SLOT = ["gemini/gemini-3.8-flash", "gemini/gemini-3.5-flash"]
+DEFAULT_GROQ_120B_SLOT = ["groq/openai/gpt-oss-120b"]
+DEFAULT_GROQ_QWEN_SLOT = ["groq/qwen/qwen3.8-27b"]
+DEFAULT_MODEL_SLOTS = [DEFAULT_GEMINI_SLOT, DEFAULT_GROQ_120B_SLOT, DEFAULT_GROQ_QWEN_SLOT]
+# OpenRouter :free fallback pool -- only reached by a slot whose own
+# candidate(s) are all unhealthy. Free-tier availability churns fast here
+# (two different models broke in two different ways within 48h on
+# 2026-10-05/06: one rate-limited, one permanently retired/paywalled),
+# hence several candidates rather than one.
+DEFAULT_OPENROUTER_FALLBACK_POOL = [
     "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
     "openrouter/apodex/apodex-1.1-mini:free",
     "openrouter/inclusionai/ling-3.0-flash-sante:free",
     "openrouter/dots-studio/dots-3-note-preview:free",
+]
+# Static fallback ensemble (used only if something constructs the bot
+# without going through the health-check flow, e.g. tests). The real run
+# path (main.py) always health-checks `model_slots` at startup via
+# select_ensemble_by_slot and substitutes whichever model actually
+# answered for each slot.
+DEFAULT_MODELS = [
+    "gemini/gemini-3.8-flash",
+    "groq/openai/gpt-oss-120b",
+    "groq/qwen/qwen3.8-27b",
 ]
 # Lighter-weight models for the parser/summarizer role (structured-output
 # parsing fallback + research summarization) -- doesn't need frontier
@@ -100,7 +105,8 @@ def _get_list(name: str, default: list[str]) -> list[str]:
 class Config:
     # Ensemble
     models: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
-    model_pool: list[str] = field(default_factory=lambda: list(DEFAULT_MODEL_POOL))
+    model_slots: list[list[str]] = field(default_factory=lambda: [list(slot) for slot in DEFAULT_MODEL_SLOTS])
+    openrouter_fallback_pool: list[str] = field(default_factory=lambda: list(DEFAULT_OPENROUTER_FALLBACK_POOL))
     parser_model_pool: list[str] = field(default_factory=lambda: list(DEFAULT_PARSER_MODEL_POOL))
     target_ensemble_size: int = 3
     n_runs: int = 3
@@ -182,7 +188,13 @@ class Config:
 def load_config() -> Config:
     return Config(
         models=_get_list("BOT_MODELS", DEFAULT_MODELS),
-        model_pool=_get_list("BOT_MODEL_POOL", DEFAULT_MODEL_POOL),
+        # Not env-overridable (unlike the other *_pool settings below): a
+        # nested slot structure doesn't fit the flat comma-separated format
+        # _get_list expects, and BOT_MODEL_POOL (the old flat equivalent)
+        # was never actually set anywhere outside .env.template's commented-
+        # out example.
+        model_slots=[list(slot) for slot in DEFAULT_MODEL_SLOTS],
+        openrouter_fallback_pool=_get_list("BOT_OPENROUTER_FALLBACK_POOL", DEFAULT_OPENROUTER_FALLBACK_POOL),
         parser_model_pool=_get_list("BOT_PARSER_MODEL_POOL", DEFAULT_PARSER_MODEL_POOL),
         target_ensemble_size=_get_int("BOT_TARGET_ENSEMBLE_SIZE", 3),
         n_runs=_get_int("BOT_N_RUNS", 3),

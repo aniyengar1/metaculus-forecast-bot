@@ -1,7 +1,6 @@
 """
-Self-healing model roster: before each run, health-checks candidates in
-cfg.model_pool with a tiny request, then selects the first `target_count`
-healthy models in pool order.
+Self-healing model roster: before each run, health-checks candidates with a
+tiny request, then selects which models actually make the ensemble.
 
 Free-tier model availability churns: a model can get transiently
 rate-limited (HTTP 429 -- retried with backoff, see llm_retry.py) or
@@ -10,12 +9,19 @@ retried, since no amount of waiting fixes that). Both are treated as "not
 healthy for this run" here; the caller decides what to do if too few models
 survive (main.py aborts the run rather than forecast with <2 models).
 
-Selection is pure priority order, not provider-diversity-dedup: as of
-2026-10-12 the pool is explicitly hand-ordered (gemini, then 2 distinct Groq
-models, then an OpenRouter :free fallback tier), so preferring one-per-
-provider would actually fight the intended ordering -- it would skip the
-second (intentional) Groq model in favor of jumping straight to the
-OpenRouter fallback tier. See docs/STAGE_B_PLAN.md "Multi-provider pool".
+Two selection functions, for two different shapes of candidate list:
+
+- select_ensemble_by_slot: the primary ensemble (cfg.model_slots). Each
+  "slot" (Gemini, gpt-oss-120b, qwen3.8-27b) gets exactly one model --
+  see its own docstring for why this replaced a flat priority list
+  2026-10-30.
+- select_healthy_models: everything else (currently just the parser/
+  summarizer pool, cfg.parser_model_pool) -- a flat priority-ordered list,
+  "first target_count healthy entries in list order." As of 2026-10-12
+  that pool is explicitly hand-ordered (gemini, then Groq, then an
+  OpenRouter :free fallback tier), so preferring one-per-provider would
+  actually fight the intended ordering. See docs/STAGE_B_PLAN.md
+  "Multi-provider pool".
 
 Two cost-control measures added 2026-10-19 after OpenRouter's entire
 50/day account-wide free-tier cap got burned by health checks alone (0 real
@@ -131,7 +137,9 @@ async def select_healthy_models(
     _check_models_cached), then returns (selected, all_results). `selected`
     is the first `target_count` healthy models in pool order. Only checks
     the OpenRouter fallback tier if the primary models don't already
-    satisfy `target_count` -- see module docstring.
+    satisfy `target_count` -- see module docstring. Generic flat-list
+    selection, still used for the parser/summarizer pool (main.py); the
+    primary ensemble uses select_ensemble_by_slot instead (below).
     """
     primary = [m for m in model_pool if provider_of(m) != "openrouter"]
     fallback = [m for m in model_pool if provider_of(m) == "openrouter"]
@@ -144,4 +152,51 @@ async def select_healthy_models(
 
     selected = [m for m in model_pool if results.get(m) and results[m].healthy][:target_count]
     all_results = [results[m] for m in model_pool if m in results]
+    return selected, all_results
+
+
+async def select_ensemble_by_slot(
+    conn: sqlite3.Connection, slots: list[list[str]], openrouter_fallback_pool: list[str]
+) -> tuple[list[str], list[HealthResult]]:
+    """
+    Selects exactly one model per slot (ensemble size == len(slots)), fixing
+    a 2026-10-30 bug in the old flat-priority-list `select_healthy_models`:
+    with gemini-3.5-flash and gemini-3.8-flash both early in that list, a
+    fully healthy run selected both of them and dropped qwen3.8-27b
+    entirely -- "first N healthy in list order" doesn't preserve the
+    intended one-model-per-provider-slot diversity once a slot has more
+    than one candidate.
+
+    For each slot, checks its candidates (cached results preferred) and
+    takes the first healthy one in the slot's own preference order. A slot
+    left unfilled (every candidate unhealthy) is instead filled from
+    `openrouter_fallback_pool` -- checked only if at least one slot needs
+    it, same cost-control rationale as select_healthy_models' fallback
+    tier. If the fallback pool doesn't have enough healthy models for
+    every unfilled slot, the ensemble just comes back smaller than
+    len(slots) (caller already handles <2 models as an abort condition).
+
+    Returns (selected, all_results) -- selected has at most one model per
+    slot; all_results covers every candidate actually checked, slot
+    candidates first (in slot order), then any fallback candidates.
+    """
+    selected: list[str] = []
+    all_results: list[HealthResult] = []
+    unfilled_slots = 0
+
+    for slot_candidates in slots:
+        results = await _check_models_cached(conn, slot_candidates)
+        all_results.extend(results[m] for m in slot_candidates)
+        healthy_in_slot = [m for m in slot_candidates if results[m].healthy]
+        if healthy_in_slot:
+            selected.append(healthy_in_slot[0])
+        else:
+            unfilled_slots += 1
+
+    if unfilled_slots and openrouter_fallback_pool:
+        fallback_results = await _check_models_cached(conn, openrouter_fallback_pool)
+        all_results.extend(fallback_results[m] for m in openrouter_fallback_pool)
+        healthy_fallback = [m for m in openrouter_fallback_pool if fallback_results[m].healthy]
+        selected.extend(healthy_fallback[:unfilled_slots])
+
     return selected, all_results

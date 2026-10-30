@@ -1129,3 +1129,67 @@ removed (asserted the now-reverted value); `tests/test_config.py` updated
 to assert the new order (`gemini-3.5-flash` before `gemini-3.8-flash`,
 both before the OpenRouter tier) instead. 135/135 tests still pass
 (net-zero: one test removed, one split into two), pyflakes clean.
+
+## Slot-based model selection, 2026-10-30
+
+The flat-list reorder above fixed "3.8-flash is unreliable" but introduced
+a worse problem noticed immediately after: `DEFAULT_MODEL_POOL` was now
+`[gemini-3.5-flash, gemini-3.8-flash, groq-120b, groq-qwen, ...]`, and
+`select_healthy_models` just takes the first `target_count` (3) healthy
+entries in list order. A fully healthy run therefore selected **both**
+Gemini models and **dropped qwen3.8-27b entirely** -- less provider
+diversity than before any of this week's changes, for no actual reliability
+reason (qwen wasn't unhealthy, it just lost a race to be "first 3 in the
+list").
+
+**Fix**: replaced the flat list with an explicit slot structure --
+`metaculus_bot.config.DEFAULT_MODEL_SLOTS`, a `list[list[str]]` where each
+inner list is one ensemble "slot"'s candidates in preference order:
+
+```python
+DEFAULT_GEMINI_SLOT = ["gemini/gemini-3.8-flash", "gemini/gemini-3.5-flash"]
+DEFAULT_GROQ_120B_SLOT = ["groq/openai/gpt-oss-120b"]
+DEFAULT_GROQ_QWEN_SLOT = ["groq/qwen/qwen3.8-27b"]
+DEFAULT_MODEL_SLOTS = [DEFAULT_GEMINI_SLOT, DEFAULT_GROQ_120B_SLOT, DEFAULT_GROQ_QWEN_SLOT]
+```
+
+Within the Gemini slot, 3.8-flash goes back to being preferred (the
+stronger model) with 3.5-flash as same-family fallback -- the 2026-10-28
+reorder that promoted 3.5-flash was specifically working around the "two
+Gemini models fill the ensemble" bug, which the slot structure now fixes
+directly, so that workaround is no longer needed.
+
+New `metaculus_bot.model_health.select_ensemble_by_slot(conn, slots,
+openrouter_fallback_pool)`: for each slot, health-checks its own
+candidates and takes the first healthy one; a slot left unfilled (every
+candidate unhealthy) is filled from the OpenRouter `:free` pool instead
+(checked only if at least one slot needs it, same cost-control rationale
+as the old fallback-tier gating). Ensemble size is always `len(slots)` (3)
+when all 3 slots fill themselves, and never includes two models for the
+same slot. `select_healthy_models` (the old flat-list function) is
+unchanged and still used for `cfg.parser_model_pool` -- that pool has no
+slot structure of its own, so the flat "first target_count healthy" logic
+is still the right fit there.
+
+Config changes: `Config.model_pool: list[str]` replaced by
+`Config.model_slots: list[list[str]]` (hardcoded from `DEFAULT_MODEL_SLOTS`,
+not env-overridable in this pass -- a nested structure doesn't fit the
+flat comma-separated `_get_list` format, and `BOT_MODEL_POOL` was never
+actually set anywhere outside `.env.template`'s commented-out example) and
+`Config.openrouter_fallback_pool: list[str]` (still env-overridable via
+the renamed `BOT_OPENROUTER_FALLBACK_POOL`). `main.py` updated at both
+call sites (the health-check call itself, and the `<2 models` abort
+alert's pool description).
+
+Covered by `tests/test_config.py` (rewritten: asserts the 3-slot
+structure, 3.8-flash preferred within the Gemini slot, no slot candidate
+is an OpenRouter model) and `tests/test_model_health.py` (6 new tests,
+including the one that directly locks in the bug fix:
+`test_fully_healthy_run_yields_one_gemini_120b_and_qwen` asserts a fully
+healthy run's selection is exactly `{gemini-3.8-flash, gpt-oss-120b,
+qwen3.8-27b}` and never touches the OpenRouter fallback pool; others cover
+the Gemini-slot fallback, a single unfilled slot pulling from OpenRouter,
+two unfilled slots each getting a distinct fallback model, the fallback
+pool staying untouched when nothing's unfilled, and a smaller-than-3
+ensemble when the fallback pool itself runs short). 141/141 tests pass,
+pyflakes clean.

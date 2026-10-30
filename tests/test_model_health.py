@@ -19,7 +19,8 @@ from datetime import datetime, timedelta, timezone
 
 import metaculus_bot.model_health as model_health
 from metaculus_bot import db
-from metaculus_bot.model_health import HealthResult, select_healthy_models
+from metaculus_bot.config import DEFAULT_MODEL_SLOTS, DEFAULT_OPENROUTER_FALLBACK_POOL
+from metaculus_bot.model_health import HealthResult, select_ensemble_by_slot, select_healthy_models
 
 
 def _conn() -> sqlite3.Connection:
@@ -155,3 +156,118 @@ def test_get_cached_model_health_unhealthy_ttl_is_shorter_than_healthy():
 
     # Still well within the 1h healthy TTL, but past the 5-min unhealthy TTL.
     assert db.get_cached_model_health(conn, "m1", healthy_ttl_seconds=3600, unhealthy_ttl_seconds=300) is None
+
+
+def test_fully_healthy_run_yields_one_gemini_120b_and_qwen(monkeypatch):
+    """The actual fix (2026-10-30): with the old flat priority list, a fully
+    healthy run selected the first 3 entries in list order -- which could be
+    *two* Gemini models, dropping qwen3.8-27b entirely. Slot-based selection
+    must always yield exactly one Gemini model + gpt-oss-120b + qwen3.8-27b
+    when everything is healthy, and must never touch the OpenRouter fallback
+    pool in that case."""
+    fallback_checked = []
+
+    async def fake_check_one(model):
+        if model in DEFAULT_OPENROUTER_FALLBACK_POOL:
+            fallback_checked.append(model)
+        return HealthResult(model=model, healthy=True)
+
+    monkeypatch.setattr(model_health, "_check_one", fake_check_one)
+    conn = _conn()
+
+    selected, results = asyncio.run(
+        select_ensemble_by_slot(conn, DEFAULT_MODEL_SLOTS, DEFAULT_OPENROUTER_FALLBACK_POOL)
+    )
+
+    assert set(selected) == {"gemini/gemini-3.8-flash", "groq/openai/gpt-oss-120b", "groq/qwen/qwen3.8-27b"}
+    assert len(selected) == 3
+    assert fallback_checked == []  # fallback pool never touched -- every slot filled itself
+
+
+def test_gemini_slot_falls_back_to_35_flash_when_38_flash_unhealthy(monkeypatch):
+    async def fake_check_one(model):
+        healthy = model != "gemini/gemini-3.8-flash"
+        return HealthResult(model=model, healthy=healthy)
+
+    monkeypatch.setattr(model_health, "_check_one", fake_check_one)
+    conn = _conn()
+
+    selected, _ = asyncio.run(
+        select_ensemble_by_slot(conn, DEFAULT_MODEL_SLOTS, DEFAULT_OPENROUTER_FALLBACK_POOL)
+    )
+
+    assert "gemini/gemini-3.5-flash" in selected
+    assert "gemini/gemini-3.8-flash" not in selected
+    assert len(selected) == 3
+
+
+def test_unfilled_slot_falls_back_to_openrouter(monkeypatch):
+    """Both Gemini candidates down -> that slot (and only that slot) is
+    filled from the OpenRouter fallback pool."""
+
+    async def fake_check_one(model):
+        healthy = "gemini" not in model
+        return HealthResult(model=model, healthy=healthy)
+
+    monkeypatch.setattr(model_health, "_check_one", fake_check_one)
+    conn = _conn()
+
+    selected, _ = asyncio.run(
+        select_ensemble_by_slot(conn, DEFAULT_MODEL_SLOTS, DEFAULT_OPENROUTER_FALLBACK_POOL)
+    )
+
+    assert "groq/openai/gpt-oss-120b" in selected
+    assert "groq/qwen/qwen3.8-27b" in selected
+    assert not any("gemini" in m for m in selected)
+    assert any(m in DEFAULT_OPENROUTER_FALLBACK_POOL for m in selected)
+    assert len(selected) == 3
+
+
+def test_openrouter_fallback_pool_untouched_when_no_slot_unfilled(monkeypatch):
+    checked = []
+
+    async def fake_check_one(model):
+        checked.append(model)
+        return HealthResult(model=model, healthy=True)
+
+    monkeypatch.setattr(model_health, "_check_one", fake_check_one)
+    conn = _conn()
+
+    asyncio.run(select_ensemble_by_slot(conn, DEFAULT_MODEL_SLOTS, DEFAULT_OPENROUTER_FALLBACK_POOL))
+
+    assert not any(m in DEFAULT_OPENROUTER_FALLBACK_POOL for m in checked)
+
+
+def test_two_unfilled_slots_each_get_a_distinct_fallback_model(monkeypatch):
+    slots = [["gemini/a"], ["groq/b"], ["groq/c"]]
+    fallback_pool = ["openrouter/x:free", "openrouter/y:free"]
+
+    async def fake_check_one(model):
+        healthy = model not in ("gemini/a", "groq/b")  # those two slots' own candidates are dead
+        return HealthResult(model=model, healthy=healthy)
+
+    monkeypatch.setattr(model_health, "_check_one", fake_check_one)
+    conn = _conn()
+
+    selected, _ = asyncio.run(select_ensemble_by_slot(conn, slots, fallback_pool))
+
+    assert "groq/c" in selected
+    assert "openrouter/x:free" in selected
+    assert "openrouter/y:free" in selected
+    assert len(selected) == 3
+
+
+def test_fewer_fallback_models_than_unfilled_slots_yields_smaller_ensemble(monkeypatch):
+    slots = [["gemini/a"], ["groq/b"], ["groq/c"]]
+    fallback_pool = ["openrouter/x:free"]  # only 1 fallback candidate for 2 dead slots
+
+    async def fake_check_one(model):
+        healthy = model not in ("gemini/a", "groq/b")  # those two slots' own candidates are dead
+        return HealthResult(model=model, healthy=healthy)
+
+    monkeypatch.setattr(model_health, "_check_one", fake_check_one)
+    conn = _conn()
+
+    selected, _ = asyncio.run(select_ensemble_by_slot(conn, slots, fallback_pool))
+
+    assert selected == ["groq/c", "openrouter/x:free"]

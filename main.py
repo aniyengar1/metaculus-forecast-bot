@@ -35,7 +35,7 @@ from metaculus_bot import db  # noqa: E402
 from metaculus_bot.bot import BudgetSkipped, FutureEvalBot, InvalidDistributionSkipped  # noqa: E402
 from metaculus_bot.budget import BudgetGuard  # noqa: E402
 from metaculus_bot.config import load_config  # noqa: E402
-from metaculus_bot.model_health import select_healthy_models  # noqa: E402
+from metaculus_bot.model_health import select_ensemble_by_slot, select_healthy_models  # noqa: E402
 from metaculus_bot.openrouter_quota import get_free_model_daily_quota  # noqa: E402
 from metaculus_bot.provider_quota import (  # noqa: E402
     compute_daily_question_budget,
@@ -343,9 +343,13 @@ async def _run(args: argparse.Namespace) -> int:
             _check_closed_unforecast(conn)
             return 0
 
-        print(f"Health-checking model pool ({len(cfg.model_pool)} candidates)...")
-        selected_models, health_results = await select_healthy_models(
-            conn, cfg.model_pool, target_count=cfg.target_ensemble_size
+        slot_candidate_count = sum(len(slot) for slot in cfg.model_slots)
+        print(
+            f"Health-checking model ensemble ({len(cfg.model_slots)} slots, "
+            f"{slot_candidate_count} candidates, {len(cfg.openrouter_fallback_pool)} fallback)..."
+        )
+        selected_models, health_results = await select_ensemble_by_slot(
+            conn, cfg.model_slots, cfg.openrouter_fallback_pool
         )
         for r in health_results:
             status = "healthy" if r.healthy else f"DEAD -- {r.error}"
@@ -354,7 +358,8 @@ async def _run(args: argparse.Namespace) -> int:
 
         if len(selected_models) < 2:
             alert_msg = (
-                f"Only {len(selected_models)} healthy model(s) out of pool {cfg.model_pool} "
+                f"Only {len(selected_models)} healthy model(s) out of slots {cfg.model_slots} "
+                f"(fallback pool {cfg.openrouter_fallback_pool}) "
                 f"-- aborting run rather than forecasting with fewer than 2 models."
             )
             logger.error(alert_msg)
