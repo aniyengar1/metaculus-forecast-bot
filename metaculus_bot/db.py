@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS forecasts (
     estimated_cost_usd REAL,
     tournament TEXT,
     status TEXT NOT NULL,
-    error_message TEXT
+    error_message TEXT,
+    research_quality TEXT,
+    guard_fired INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS resolutions (
@@ -102,6 +104,8 @@ CREATE TABLE IF NOT EXISTS model_health_cache (
 _FORECASTS_TABLE_MIGRATIONS = [
     ("estimated_cost_usd", "REAL"),
     ("tournament", "TEXT"),
+    ("research_quality", "TEXT"),
+    ("guard_fired", "INTEGER"),
 ]
 
 _RESOLUTIONS_TABLE_MIGRATIONS = [
@@ -156,6 +160,8 @@ def log_forecast(
     estimated_cost_usd: float | None = None,
     tournament: str | None = None,
     error_message: str | None = None,
+    research_quality: str | None = None,
+    guard_fired: bool | None = None,
 ) -> int:
     cur = conn.execute(
         """
@@ -163,8 +169,9 @@ def log_forecast(
             run_timestamp, question_id, post_id, question_title, question_type,
             question_url, research_summary, raw_model_outputs, aggregate_value,
             post_calibration_value, submitted_value, dry_run, models_used,
-            n_runs, cost_usd, estimated_cost_usd, tournament, status, error_message
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            n_runs, cost_usd, estimated_cost_usd, tournament, status, error_message,
+            research_quality, guard_fired
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
@@ -186,6 +193,8 @@ def log_forecast(
             tournament,
             status,
             error_message,
+            research_quality,
+            None if guard_fired is None else (1 if guard_fired else 0),
         ),
     )
     conn.commit()
@@ -462,15 +471,22 @@ def count_tracked_binary_resolutions(conn: sqlite3.Connection) -> int:
     return int(row[0] or 0)
 
 
-def count_reforecasts_today(conn: sqlite3.Connection) -> int:
+def count_reforecasts_today(conn: sqlite3.Connection, *, tournament: str | None = None) -> int:
     """How many of today's successful forecasts are a *re*-forecast (i.e.
     this question already had an earlier successful forecast, today or any
-    prior day) -- for the max_reforecasts_per_day cap."""
+    prior day) -- for the max_reforecasts_per_day cap.
+
+    `tournament` optionally restricts the count to one tournament's own rows
+    (e.g. "market_pulse"), so two tournaments that both re-forecast stale
+    questions (seasonal, market_pulse) each get their own daily cap instead
+    of silently sharing one global counter."""
     today = _today()
+    tournament_clause = "" if tournament is None else "AND f1.tournament = ?"
+    params: tuple = (today,) if tournament is None else (today, tournament)
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) FROM forecasts f1
-        WHERE f1.status = 'ok' AND substr(f1.run_timestamp, 1, 10) = ?
+        WHERE f1.status = 'ok' AND substr(f1.run_timestamp, 1, 10) = ? {tournament_clause}
           AND EXISTS (
               SELECT 1 FROM forecasts f2
               WHERE f2.question_id = f1.question_id
@@ -478,6 +494,6 @@ def count_reforecasts_today(conn: sqlite3.Connection) -> int:
                 AND f2.run_timestamp < f1.run_timestamp
           )
         """,
-        (today,),
+        params,
     ).fetchone()
     return int(row[0] or 0)

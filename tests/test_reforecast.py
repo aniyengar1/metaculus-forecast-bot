@@ -9,13 +9,15 @@ from datetime import datetime, timedelta, timezone
 from metaculus_bot import db
 
 
-def _insert_ok_forecast(conn: sqlite3.Connection, question_id: int, when: datetime) -> None:
+def _insert_ok_forecast(
+    conn: sqlite3.Connection, question_id: int, when: datetime, tournament: str | None = None
+) -> None:
     conn.execute(
         """
-        INSERT INTO forecasts (run_timestamp, question_id, dry_run, status)
-        VALUES (?, ?, 0, 'ok')
+        INSERT INTO forecasts (run_timestamp, question_id, dry_run, status, tournament)
+        VALUES (?, ?, 0, 'ok', ?)
         """,
-        (when.isoformat(), question_id),
+        (when.isoformat(), question_id, tournament),
     )
     conn.commit()
 
@@ -58,3 +60,24 @@ def test_count_reforecasts_today_counts_genuine_reforecasts_only():
     # Question 2: forecast for the first time today -- does not count.
     _insert_ok_forecast(conn, 2, now)
     assert db.count_reforecasts_today(conn) == 1
+
+
+def test_count_reforecasts_today_tournament_filter_is_independent():
+    """seasonal and market_pulse each re-forecast stale questions on their
+    own cadence -- each must get its own daily cap, not share one global
+    counter (see main.py's _select_reforecast_candidates, which now passes
+    tournament_label through to this filter)."""
+    conn = _conn()
+    now = datetime.now(timezone.utc)
+    # Seasonal: one genuine re-forecast today.
+    _insert_ok_forecast(conn, 1, now - timedelta(days=10), tournament="seasonal")
+    _insert_ok_forecast(conn, 1, now, tournament="seasonal")
+    # Market Pulse: two genuine re-forecasts today.
+    _insert_ok_forecast(conn, 2, now - timedelta(days=5), tournament="market_pulse")
+    _insert_ok_forecast(conn, 2, now, tournament="market_pulse")
+    _insert_ok_forecast(conn, 3, now - timedelta(days=5), tournament="market_pulse")
+    _insert_ok_forecast(conn, 3, now, tournament="market_pulse")
+
+    assert db.count_reforecasts_today(conn, tournament="seasonal") == 1
+    assert db.count_reforecasts_today(conn, tournament="market_pulse") == 2
+    assert db.count_reforecasts_today(conn) == 3  # unfiltered still sums both

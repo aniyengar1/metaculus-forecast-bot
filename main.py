@@ -46,10 +46,11 @@ from metaculus_bot.transient_errors import is_transient_provider_or_metaculus_er
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Scope decision (Phase 2): only the Fall 2026 seasonal tournament + current
-# MiniBench round. Metaculus Cup and Market Pulse are deliberately excluded
-# for now -- Market Pulse needs continuous intra-day updating we haven't
-# built, Cup is lower priority. Revisit once Stage A/B are solid.
+# Scope: the Fall 2026 seasonal tournament, current MiniBench round, and
+# (2026-11-09) Market Pulse Challenge 26Q4 -- bots are included in its bot
+# leaderboard and it re-forecasts on its own 3-day cadence (see
+# cfg.market_pulse_reforecast_staleness_days), same re-forecast mechanism as
+# seasonal. Metaculus Cup remains deliberately excluded (lower priority).
 TOURNAMENT_URLS = {
     "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
     "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
@@ -136,7 +137,11 @@ def _select_diverse_subset(
 
 
 async def _fetch_one_tournament_with_diagnostics(
-    client: MetaculusClient, tournament_id: int | str, label: str
+    client: MetaculusClient,
+    tournament_id: int | str,
+    label: str,
+    *,
+    group_question_mode: str = "exclude",
 ) -> tuple[list[MetaculusQuestion], list[MetaculusQuestion]]:
     """Fetches EVERY question in the tournament regardless of status (not
     just open ones), logs a full breakdown (total / by status / open-but-
@@ -148,8 +153,18 @@ async def _fetch_one_tournament_with_diagnostics(
     questions' in forecasting_tools' own logs (which only ever reports the
     post-filter count) is distinguishable from a filter bug: if our own
     unfiltered count also says 0 (or 0 open), the filter is working
-    correctly and there's just nothing to forecast right now."""
-    api_filter = ApiFilter(allowed_tournaments=[tournament_id])  # no status/type restriction
+    correctly and there's just nothing to forecast right now.
+
+    `group_question_mode` defaults to the SDK's own default ("exclude",
+    which drops any post whose questions are sub-questions of a group --
+    none of MiniBench/seasonal's questions are, so this has never mattered
+    there). Market Pulse's questions this cycle are *all* grouped (numeric-
+    group/discrete-group posts), confirmed empirically 2026-11-09: the
+    default silently returned 0 questions. Callers for a tournament known
+    to use group questions should pass "unpack_subquestions" instead."""
+    api_filter = ApiFilter(
+        allowed_tournaments=[tournament_id], group_question_mode=group_question_mode
+    )  # no status/type restriction
     all_questions = await client.get_questions_matching_filter(api_filter)
 
     by_status = Counter(q.state.value if q.state else "unknown" for q in all_questions)
@@ -167,17 +182,23 @@ async def _fetch_one_tournament_with_diagnostics(
 
 
 async def _select_reforecast_candidates(
-    already_forecasted: list[MetaculusQuestion], conn, cfg
+    already_forecasted: list[MetaculusQuestion],
+    conn,
+    *,
+    staleness_days: int,
+    max_per_day: int,
+    tournament_label: str,
 ) -> list[MetaculusQuestion]:
-    """Still-open seasonal questions we've already forecast, but whose last
-    forecast is stale enough to redo (new information may have changed
-    things) -- oldest-forecast-first, capped at
-    cfg.max_reforecasts_per_day *for the whole day across all runs*, not
-    per-run."""
+    """Still-open questions we've already forecast, but whose last forecast
+    is stale enough to redo (new information may have changed things) --
+    oldest-forecast-first, capped at `max_per_day` *for the whole day across
+    all runs of this one tournament*, not per-run (see
+    db.count_reforecasts_today's `tournament` filter -- each tournament that
+    uses this gets its own independent daily cap)."""
     if not already_forecasted:
         return []
     now = datetime.now(timezone.utc)
-    staleness = timedelta(days=cfg.reforecast_staleness_days)
+    staleness = timedelta(days=staleness_days)
     stale: list[tuple[datetime, MetaculusQuestion]] = []
     for q in already_forecasted:
         last = db.get_last_forecast_time(conn, q.id_of_question)
@@ -185,8 +206,8 @@ async def _select_reforecast_candidates(
             stale.append((last, q))
     stale.sort(key=lambda pair: pair[0])  # oldest-forecast-first
 
-    done_today = db.count_reforecasts_today(conn)
-    remaining_cap = max(cfg.max_reforecasts_per_day - done_today, 0)
+    done_today = db.count_reforecasts_today(conn, tournament=tournament_label)
+    remaining_cap = max(max_per_day - done_today, 0)
     return [q for _, q in stale[:remaining_cap]]
 
 
@@ -220,7 +241,13 @@ async def _fetch_questions(
                 client, client.CURRENT_AI_COMPETITION_ID, "seasonal"
             )
             questions += not_yet
-            reforecast_candidates = await _select_reforecast_candidates(already, conn, cfg)
+            reforecast_candidates = await _select_reforecast_candidates(
+                already,
+                conn,
+                staleness_days=cfg.reforecast_staleness_days,
+                max_per_day=cfg.max_reforecasts_per_day,
+                tournament_label="seasonal",
+            )
             if reforecast_candidates:
                 print(
                     f"[seasonal] re-forecasting {len(reforecast_candidates)} stale question(s) "
@@ -237,6 +264,32 @@ async def _fetch_questions(
             client, client.CURRENT_MINIBENCH_ID, "minibench"
         )
         questions += not_yet
+    if target == "market_pulse":
+        if cfg.enable_market_pulse_tournament:
+            not_yet, already = await _fetch_one_tournament_with_diagnostics(
+                client,
+                client.CURRENT_MARKET_PULSE_ID,
+                "market_pulse",
+                group_question_mode="unpack_subquestions",
+            )
+            questions += not_yet
+            reforecast_candidates = await _select_reforecast_candidates(
+                already,
+                conn,
+                staleness_days=cfg.market_pulse_reforecast_staleness_days,
+                max_per_day=cfg.market_pulse_max_reforecasts_per_day,
+                tournament_label="market_pulse",
+            )
+            if reforecast_candidates:
+                print(
+                    f"[market_pulse] re-forecasting {len(reforecast_candidates)} stale question(s) "
+                    f"(last forecast >{cfg.market_pulse_reforecast_staleness_days}d ago)"
+                )
+            questions += reforecast_candidates
+        else:
+            print(
+                "  (market pulse tournament skipped: ENABLE_MARKET_PULSE_TOURNAMENT is False)"
+            )
     return questions
 
 
@@ -260,7 +313,7 @@ async def _run(args: argparse.Namespace) -> int:
         elif args.post_ids:
             tournament_label = "manual"
         else:
-            tournament_label = args.target  # "seasonal" | "minibench" | "both"
+            tournament_label = args.target  # "seasonal" | "minibench" | "market_pulse" | "both"
 
         client = MetaculusClient()
         # Fetching can raise after the SDK's own retry-with-backoff is
@@ -392,10 +445,11 @@ async def _run(args: argparse.Namespace) -> int:
         # metaculus_bot/provider_quota.py. Computed only now because it needs
         # to know which specific models (incl. the parser) are actually in
         # play this run. MiniBench gets priority on the shared quota (it
-        # polls every 15 min against ~3h question windows; seasonal polls
-        # hourly against multi-day windows) by having the seasonal run
-        # deliberately reserve some headroom rather than spend down to zero.
-        minibench_reserve = cfg.minibench_quota_reserve if tournament_label == "seasonal" else 0
+        # polls every 15 min against ~3h question windows; seasonal and
+        # market_pulse poll against longer windows) by having both of those
+        # runs deliberately reserve some headroom rather than spend down to
+        # zero.
+        minibench_reserve = cfg.minibench_quota_reserve if tournament_label in ("seasonal", "market_pulse") else 0
         daily_budget = compute_daily_question_budget(
             selected_models,
             parser_model,
@@ -540,6 +594,8 @@ async def _run(args: argparse.Namespace) -> int:
                 estimated_cost_usd=estimated_cost,
                 tournament=tournament_label,
                 status="ok",
+                research_quality=debug.get("research_quality"),
+                guard_fired=debug.get("guard_fired"),
             )
             if question.id_of_question is not None:
                 db.mark_question_forecasted(conn, question.id_of_question)
@@ -594,9 +650,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--target",
         type=str,
-        choices=["both", "seasonal", "minibench"],
+        choices=["both", "seasonal", "minibench", "market_pulse"],
         default="both",
-        help="Only used with --mode tournament",
+        help="Only used with --mode tournament. 'both' = seasonal + minibench "
+        "(unchanged scope); market_pulse is its own target, run from a "
+        "separate workflow, same as seasonal/minibench.",
     )
     parser.add_argument(
         "--publish",

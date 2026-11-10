@@ -20,9 +20,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from forecasting_tools import DateQuestion, NumericDistribution, NumericQuestion
+from forecasting_tools import DateQuestion, NumericDistribution, NumericQuestion, Percentile
 
 _BOUND_EPSILON_SECONDS = 1.0  # float-rounding slack at the exact bound
+
+# Default threshold for percentile_band_too_wide -- see docstring there.
+_DEFAULT_WIDTH_FRACTION = 0.8
 
 
 def check_numeric_or_date_distribution(
@@ -68,3 +71,37 @@ def _format(value: float, is_date: bool) -> str:
     if is_date:
         return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%d")
     return f"{value:.4g}"
+
+
+def percentile_band_too_wide(
+    percentiles: list[Percentile],
+    question: NumericQuestion | DateQuestion,
+    *,
+    width_fraction: float = _DEFAULT_WIDTH_FRACTION,
+) -> bool:
+    """True if this model's own elicited P10-P90 spans more than
+    `width_fraction` of the question's full [lower_bound, upper_bound]
+    range -- a "90% confidence interval" that's almost the entire possible
+    range is rarely a reasoned forecast, usually a model hedging by
+    guessing near-full-range instead of anchoring on the latest data/base
+    rate (see the 2026-11-09 review: the Edgewater referendum and Swiss
+    drought questions both lost points this way). Called per-model, before
+    aggregation, on the model's own sparse elicited percentiles -- not the
+    aggregated/dense distribution (see metaculus_bot.bot's regenerate-once
+    call sites). Returns False (not an error) if P10/P90 aren't present in
+    `percentiles` or the question's range is degenerate -- this is a soft
+    quality nudge, not something that should ever block a real forecast on
+    a missing field."""
+    is_date = isinstance(question, DateQuestion)
+    lower_bound = question.lower_bound.timestamp() if is_date else question.lower_bound
+    upper_bound = question.upper_bound.timestamp() if is_date else question.upper_bound
+    question_range = upper_bound - lower_bound
+    if question_range <= 0:
+        return False
+
+    p10 = next((p.value for p in percentiles if abs(p.percentile - 0.10) < 1e-6), None)
+    p90 = next((p.value for p in percentiles if abs(p.percentile - 0.90) < 1e-6), None)
+    if p10 is None or p90 is None:
+        return False
+
+    return (p90 - p10) > width_fraction * question_range

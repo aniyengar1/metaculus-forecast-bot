@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 from forecasting_tools import GeneralLlm, MetaculusQuestion, clean_indents
 
-from metaculus_bot import db, provider_quota
+from metaculus_bot import data_index, db, provider_quota
 from metaculus_bot.config import Config, asknews_creds_present
 
 logger = logging.getLogger(__name__)
@@ -154,4 +154,12 @@ async def gather_research(
         provider_quota.handle_possible_quota_error(conn, summarizer_llm.model, e)
         summary = raw
 
-    return f"[research source: {source}]\n{summary}"
+    # Appended *after* summarization, untouched by the LLM, so a dated
+    # official number is never paraphrased/dropped by the 200-word
+    # condensation step above. If no series matches or the fetch fails,
+    # this is simply a no-op -- metaculus_bot.research_quality then judges
+    # the summary on its own merits, same as before this existed.
+    direct_data = data_index.fetch_direct_data(question.question_text, question.resolution_criteria)
+    direct_block = f"\n\n{direct_data.as_research_block()}" if direct_data else ""
+
+    return f"[research source: {source}]\n{summary}{direct_block}"

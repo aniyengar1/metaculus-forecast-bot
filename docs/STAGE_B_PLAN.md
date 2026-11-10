@@ -1193,3 +1193,158 @@ two unfilled slots each getting a distinct fallback model, the fallback
 pool staying untouched when nothing's unfilled, and a smaller-than-3
 ensemble when the fallback pool itself runs short). 141/141 tests pass,
 pyflakes clean.
+
+## Research-quality guard, direct-data fetch, numeric band check, Market Pulse enablement, 2026-11-09
+
+Follow-up to a performance review of the season so far (58 scored
+questions, avg peer -8.6): the worst loss by a wide margin was the El Niño
+question (post 46194, -136.7 peer, 83% of the whole seasonal tournament's
+score deficit) -- all three ensemble models independently agreed on 82-95%
+"yes", it resolved "no". Four changes below, plus a tournament enablement.
+
+**1. Research-quality guard** (`metaculus_bot/research_quality.py`).
+`assess_research_quality(summary)` flags "weak" research when it's empty,
+very short (<120 chars of actual content), a known fallback-chain failure
+phrase ("No recent AskNews articles found", etc.), or has no 4-digit-year
+or `YYYY-MM-DD` anywhere in it. When weak, the final forecast is pulled
+50% of the way back toward the uninformative prior: binary via
+`shrink_binary_toward_half` (reuses `calibrate_binary_probability(k=0.5)`,
+clipped to [0.15, 0.85]), multiple choice via `flatten_mc_toward_uniform`
+(each option moved halfway to 1/N), numeric/date via
+`widen_numeric_distribution` (P10-P90 widened 2x around the median,
+clipped to the question's bounds, rebuilt through the same PCHIP pipeline
+`aggregation.py` already uses). Wired into `bot.py`: quality is assessed
+once per question in `run_research` and stashed in `debug_log`; each of
+the four `_run_forecast_on_*` methods checks it after aggregating and
+before the pre-submit sanity guard, so a widened numeric distribution
+still gets validated against the question's bounds. `research_quality` and
+`guard_fired` are now logged per forecast (new `forecasts` columns, in
+both `SCHEMA` and the migration list so a legacy persisted DB upgrades
+too).
+
+**Backtest** (`scripts/backtest_research_quality_guard.py`, replays the
+guard against every resolved binary question's actually-logged
+`research_summary` + `post_calibration_value`, no LLM calls): across 31
+resolved binary questions, the guard fired on **zero** of them, including
+El Niño -- mean Brier unchanged (0.1867 before and after). Checked why:
+El Niño's logged research was not weak by this heuristic at all -- it was
+a specific, dated, multi-paragraph brief citing a WMO multi-model seasonal
+outlook forecasting the index at ~2.9°C for ASO 2026, well above the
+question's 2.10°C threshold, which is *why* every model (correctly, given
+that research) leaned "yes". The research wasn't thin; it was a confident
+answer to a different question than the one that got resolved -- the
+brief cited a predictive seasonal *outlook* made in advance, not the
+actual published index value, and resolution criteria used "RONI"
+(Relative ONI, a trend-adjusted variant), not the raw ONI a seasonal
+outlook or our own direct-data fetch (below) would quote. A length/dated-
+source heuristic cannot distinguish "well-researched forecast of a number"
+from "well-researched citation of the actual number" -- that's a real
+limitation of this guard as specified, not a bug in it: it exists to
+catch the *other* failure mode (empty/thin research letting an
+overconfident ensemble run unchecked), which none of this season's 31
+resolved binary questions happened to hit. Keeping it anyway as a cheap
+backstop against a case that hasn't shown up yet in a fairly small sample.
+
+**2. Direct data fetch for data-index questions**
+(`metaculus_bot/data_index.py`). Registry of `DataSeries` (name, keyword
+tuple, fetch function); `fetch_direct_data(question_text,
+resolution_criteria)` matches on keywords and returns a dated `DataPoint`
+or `None` (no match, or the fetch itself failed -- either way the guard
+above judges whatever research.py produced on its own merits). Two
+series to start: NOAA's Oceanic Niño Index (plain-text file, no key) and
+EIA's weekly US retail gas price (`EIA_API_KEY` optional, falls back to
+EIA's public `DEMO_KEY`). Wired into `research.gather_research`: appended
+*after* the LLM summarization step, untouched by it, so a dated official
+number can't be paraphrased away by the 200-word condensation. Adding a
+new series is one `_fetch_x() -> DataPoint` function plus one registry
+entry.
+
+Caveat confirmed by the backtest above: this would **not** have fixed the
+El Niño question even if it had existed at forecast time -- the question's
+own resolution criteria reference "RONI" specifically, and NOAA's public
+ONI file is the raw (non-trend-adjusted) index. Fetching the right number
+for the wrong metric is still the wrong number. Worth revisiting if a
+public RONI series turns up, or at minimum flagging in-prompt when a
+question's resolution criteria name a specific index *variant* rather than
+the generic series name.
+
+**3. Numeric/discrete band-width check.** Both prompts
+(`_numeric_prompt`/`_date_prompt`) now explicitly tell the model a 90/10
+interval spanning almost the question's entire range is rarely justified
+and to anchor on the latest actual data or base rate first. Enforced in
+code too: `sanity_guard.percentile_band_too_wide(percentiles, question)`
+flags a model's own elicited P10-P90 as too wide if it exceeds 80% of the
+question's `[lower_bound, upper_bound]` range; `_single_numeric_run`/
+`_single_date_run` regenerate exactly once when this fires (one extra LLM
+call with an added nudge), keeping whichever parse succeeds. This is a
+per-model, pre-aggregation check -- distinct from the research-quality
+guard's post-aggregation widening in (1), and catches the pattern seen in
+the Edgewater referendum question (P10=-0.5, P90=100.5 on a [0,100]
+range: a near-full-range guess from a single model that cost the whole
+ensemble's coverage/baseline score even though the final median landed
+fine).
+
+**4. Market Pulse Challenge 26Q4 enabled**
+(`client.CURRENT_MARKET_PULSE_ID` = `market-pulse-26q4`). Confirmed via
+the tournament API: `bot_leaderboard_status: "include"` (bots are scored
+on/eligible for this tournament's bot leaderboard), `score_type:
+"spot_peer_tournament"` (same spot-scoring as MiniBench), $7,500 prize
+pool. All of this cycle's questions are `group_of_questions` posts
+(numeric-group/discrete-group, no standalone binary/MC) -- 12 posts total
+(1 is an announcement notebook, not a real question), unpacking to 69
+individual sub-questions, 5 of which are open right now (the rest
+upcoming/closed/resolved on their own per-sub-question schedule).
+
+Caught during implementation, not before: `ApiFilter`'s default
+`group_question_mode="exclude"` silently drops any post whose questions
+are sub-questions of a group -- confirmed live (2026-11-09) that
+`--target market_pulse` returned "0 questions" with this default, even
+though the tournament clearly has open questions, because every single
+one of them is grouped. Neither MiniBench nor seasonal has ever hit this
+(none of their questions are grouped), so it was invisible until Market
+Pulse's specifically-grouped format exercised it. Fixed by giving
+`_fetch_one_tournament_with_diagnostics` a `group_question_mode` parameter
+(default stays `"exclude"`, unchanged for MiniBench/seasonal) and passing
+`"unpack_subquestions"` specifically for the market_pulse call site --
+each sub-question then flows through the rest of the pipeline as an
+ordinary `MetaculusQuestion`, confirmed with a live dry run (`--target
+market_pulse --limit 1`, no `--publish`) that produced one real numeric
+forecast end to end.
+
+New `--target market_pulse` (own workflow, `run_bot_on_market_pulse.yaml`,
+shared concurrency group, offset cron so all three interleave) forecasts
+every open sub-question and re-forecasts stale ones on its own 3-day
+cadence (not seasonal's 7-day default -- this tournament explicitly asked
+for 3 days), capped per day via new `market_pulse_max_reforecasts_per_day`.
+`_select_reforecast_candidates` in `main.py` is now parameterized
+(`staleness_days`, `max_per_day`, `tournament_label`) instead of reading
+`cfg.*` directly, so seasonal and market_pulse share the implementation
+without sharing a cadence; `db.count_reforecasts_today` gained an optional
+`tournament` filter so each tournament's daily re-forecast cap is counted
+independently rather than one global counter. MiniBench keeps quota
+priority over market_pulse the same way it already does over seasonal:
+`minibench_reserve` in `main.py` now applies whenever
+`tournament_label in ("seasonal", "market_pulse")`.
+
+**5. Reconciliation** (no code change -- answered directly, repeated here
+for the record): the "58 scored, avg -7.57" figure vs. this session's
+initial "17 scored" came from querying only the *current* MiniBench round
+(`client.CURRENT_MINIBENCH_ID`, 34 forecasted, 0 resolved -- every one has
+passed its `spot_scoring_time` but Metaculus hasn't determined/published
+the ground-truth resolution yet, so no score exists). MiniBench rotates
+through distinct rounds; the *previous* round ("MiniBench - 2026-10-19")
+had already resolved 41/42 questions. 41 (previous MiniBench round) + 17
+(seasonal) = 58, avg -8.62 -- matching the recalled figure once the
+already-resolved previous round is included (`bot-review review
+--resolved-since 90` pulls across all tournaments/rounds rather than just
+the current one). Current-round MiniBench spot-scored questions are
+locked in for scoring but genuinely not yet resolved -- there's nothing
+to fix, just a difference in which round was queried.
+
+Covered by `tests/test_research_quality.py` (quality assessment on
+empty/short/failure-phrase/undated/substantive text; shrink/flatten/widen
+math and bounds), `tests/test_data_index.py` (keyword matching,
+graceful-failure on a monkeypatched broken fetch -- no live network calls
+in CI), `tests/test_sanity_guard.py` (new `TestPercentileBandTooWide`
+class), and `tests/test_reforecast.py` (new tournament-filtered
+`count_reforecasts_today` case). 171/171 tests pass, pyflakes clean.

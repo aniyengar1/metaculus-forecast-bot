@@ -68,6 +68,9 @@ jobs:
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          # Optional: raises the EIA gas-price direct-data fetch (see
+          # metaculus_bot/data_index.py) off the shared public DEMO_KEY.
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           # Optional operational overrides -- set as repo Variables (not
           # Secrets) if you want to change these without a code change.
           # Empty/unset falls back to the code default in config.py.

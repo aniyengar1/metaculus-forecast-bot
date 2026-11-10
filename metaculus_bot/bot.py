@@ -68,7 +68,13 @@ from metaculus_bot.deterministic_parse import (
 )
 from metaculus_bot.llm_retry import invoke_with_backoff
 from metaculus_bot import provider_quota
-from metaculus_bot.sanity_guard import check_numeric_or_date_distribution
+from metaculus_bot.research_quality import (
+    assess_research_quality,
+    flatten_mc_toward_uniform,
+    shrink_binary_toward_half,
+    widen_numeric_distribution,
+)
+from metaculus_bot.sanity_guard import check_numeric_or_date_distribution, percentile_band_too_wide
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +101,23 @@ _MAX_COMMENT_CHARS = 1500
 # generous enough in practice (typical full responses measured well under
 # this) while still bounding a pathological runaway/repeating response.
 _MAX_RAW_TEXT_CHARS = 20_000
+
+# Appended to the numeric/date prompt for exactly one regenerate attempt
+# when a model's own elicited P10-P90 band is implausibly wide (see
+# metaculus_bot.sanity_guard.percentile_band_too_wide) -- capped at one
+# retry so a model that's stubbornly wide doesn't double every ensemble
+# run's cost; the original (already-parsed) percentiles are kept if the
+# retry's parse fails or comes back just as wide.
+_WIDE_BAND_RETRY_NOTE = clean_indents(
+    """
+    One more thing: your percentile 10 and percentile 90 together span almost
+    this question's entire possible range. That is rarely justified. Re-derive
+    your answer anchored on the latest actual data or historical base rate for
+    this specific metric, and only keep a band this wide if you can state a
+    specific reason (e.g. a known structural break or a historically volatile
+    series). Give your final answer in the same format as before.
+    """
+)
 
 
 def _short_value_repr(value: Any) -> str:
@@ -299,9 +322,14 @@ class FutureEvalBot(ForecastBot):
         summary = await research.gather_research(
             question, self.cfg, self.db_conn, summarizer_llm
         )
+        quality, quality_reason = assess_research_quality(summary)
+        if quality == "weak":
+            logger.info(f"Weak research for {question.page_url}: {quality_reason}")
         self.debug_log[_question_key(question)] = {
             "research_summary": summary,
             "raw_model_outputs": [],
+            "research_quality": quality,
+            "guard_fired": False,  # set True below iff a forecast method actually applies the guard
         }
         return summary
 
@@ -398,6 +426,11 @@ class FutureEvalBot(ForecastBot):
             self.cfg.calibration_clip_min,
             self.cfg.calibration_clip_max,
         )
+
+        key = _question_key(question)
+        if self.debug_log.get(key, {}).get("research_quality") == "weak":
+            calibrated = shrink_binary_toward_half(calibrated)
+            self.debug_log[key]["guard_fired"] = True
 
         self._record_debug(question, results, aggregate, calibrated)
         combined_reasoning = self._combine_reasoning(results)
@@ -501,6 +534,11 @@ class FutureEvalBot(ForecastBot):
             )
 
         aggregate = aggregate_multiple_choice_median([r.value for r in successes])
+        key = _question_key(question)
+        if self.debug_log.get(key, {}).get("research_quality") == "weak":
+            aggregate = flatten_mc_toward_uniform(aggregate)
+            self.debug_log[key]["guard_fired"] = True
+
         self._record_debug(question, results, aggregate.to_dict(), aggregate.to_dict())
         combined_reasoning = self._combine_reasoning(results)
         return ReasonedPrediction(prediction_value=aggregate, reasoning=combined_reasoning)
@@ -567,7 +605,7 @@ class FutureEvalBot(ForecastBot):
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters are humble and account for unknown unknowns, but a 90/10 interval spanning almost this question's entire possible range is rarely a reasoned forecast -- anchor your median and percentiles on the latest actual data or historical base rate for this specific metric first, and only widen further if you can state a specific reason (e.g. a known structural break, pending data revision, or a historically volatile series).
 
             The last thing you write is your final answer as:
             "
@@ -618,7 +656,7 @@ class FutureEvalBot(ForecastBot):
             (e) A brief description of an unexpected scenario that results in a low outcome.
             (f) A brief description of an unexpected scenario that results in a high outcome.
 
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters are humble and account for unknown unknowns, but a 90/10 interval spanning almost this question's entire possible range is rarely a reasoned forecast -- anchor your median and percentiles on the latest actual data or historical base rate for this specific metric first, and only widen further if you can state a specific reason (e.g. a known structural break, pending data revision, or a historically volatile series).
 
             The last thing you write is your final answer as:
             "
@@ -658,6 +696,17 @@ class FutureEvalBot(ForecastBot):
                 parse_method = "llm_fallback"
                 provider_quota.record_usage(self.db_conn, self.cfg.parser_model)
 
+            if percentile_band_too_wide(percentiles, question):
+                logger.info(
+                    f"P10-P90 band too wide (model={model_name}, run={run_index}) on "
+                    f"{question.page_url}, regenerating once"
+                )
+                retry_reasoning = await invoke_with_backoff(llm, prompt + "\n\n" + _WIDE_BAND_RETRY_NOTE)
+                provider_quota.record_usage(self.db_conn, model_name)
+                retry_percentiles = parse_numeric_percentiles(retry_reasoning)
+                if retry_percentiles is not None:
+                    reasoning, percentiles, parse_method = retry_reasoning, retry_percentiles, "deterministic_retry"
+
             distribution = build_pchip_numeric_distribution(percentiles, question)
             return ModelRunResult(
                 model=model_name,
@@ -690,6 +739,11 @@ class FutureEvalBot(ForecastBot):
         aggregate = await NumericReport.aggregate_predictions(
             [r.value for r in successes], question
         )
+        key = _question_key(question)
+        if self.debug_log.get(key, {}).get("research_quality") == "weak":
+            aggregate = widen_numeric_distribution(aggregate, question)
+            self.debug_log[key]["guard_fired"] = True
+
         self._check_distribution_or_raise(question, aggregate)
         self._record_debug(
             question, results, aggregate.get_representative_percentiles(), aggregate.get_representative_percentiles()
@@ -727,6 +781,23 @@ class FutureEvalBot(ForecastBot):
                 Percentile(percentile=dp.percentile, value=dp.value.timestamp())
                 for dp in date_percentiles
             ]
+
+            if percentile_band_too_wide(percentiles, question):
+                logger.info(
+                    f"P10-P90 band too wide (model={model_name}, run={run_index}) on "
+                    f"{question.page_url}, regenerating once"
+                )
+                retry_reasoning = await invoke_with_backoff(llm, prompt + "\n\n" + _WIDE_BAND_RETRY_NOTE)
+                provider_quota.record_usage(self.db_conn, model_name)
+                retry_date_percentiles = parse_date_percentiles(retry_reasoning)
+                if retry_date_percentiles is not None:
+                    reasoning = retry_reasoning
+                    parse_method = "deterministic_retry"
+                    percentiles = [
+                        Percentile(percentile=dp.percentile, value=dp.value.timestamp())
+                        for dp in retry_date_percentiles
+                    ]
+
             distribution = build_pchip_numeric_distribution(percentiles, question)
             return ModelRunResult(
                 model=model_name,
@@ -759,6 +830,11 @@ class FutureEvalBot(ForecastBot):
         aggregate = await NumericReport.aggregate_predictions(
             [r.value for r in successes], question
         )
+        key = _question_key(question)
+        if self.debug_log.get(key, {}).get("research_quality") == "weak":
+            aggregate = widen_numeric_distribution(aggregate, question)
+            self.debug_log[key]["guard_fired"] = True
+
         self._check_distribution_or_raise(question, aggregate)
         self._record_debug(
             question, results, aggregate.get_representative_percentiles(), aggregate.get_representative_percentiles()

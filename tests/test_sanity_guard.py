@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from forecasting_tools import DateQuestion, NumericDistribution, NumericQuestion, Percentile
 
-from metaculus_bot.sanity_guard import check_numeric_or_date_distribution
+from metaculus_bot.sanity_guard import check_numeric_or_date_distribution, percentile_band_too_wide
 
 UKRAINE_DATE_QUESTION = DateQuestion(
     id_of_question=43326,
@@ -115,3 +115,47 @@ def test_date_p10_before_now_is_fine_only_median_matters():
     dist = _date_distribution(percentiles)
     reason = check_numeric_or_date_distribution(dist, UKRAINE_DATE_QUESTION, now=datetime(2026, 10, 16, tzinfo=timezone.utc))
     assert reason is None
+
+
+class TestPercentileBandTooWide:
+    """Covers the real Edgewater referendum question (P10=-0.5, P90=100.5
+    on a [0, 100] range -- a near-full-range band) and the real gas-price
+    question's own [3.5, 6.0] bounds."""
+
+    def test_near_full_range_band_is_too_wide(self):
+        percentiles = [
+            Percentile(percentile=0.10, value=3.55),
+            Percentile(percentile=0.50, value=4.5),
+            Percentile(percentile=0.90, value=5.95),
+        ]
+        assert percentile_band_too_wide(percentiles, GAS_PRICE_NUMERIC_QUESTION) is True
+
+    def test_reasonable_band_is_not_too_wide(self):
+        percentiles = [
+            Percentile(percentile=0.10, value=4.0),
+            Percentile(percentile=0.50, value=4.2),
+            Percentile(percentile=0.90, value=4.4),
+        ]
+        assert percentile_band_too_wide(percentiles, GAS_PRICE_NUMERIC_QUESTION) is False
+
+    def test_exactly_at_threshold_is_not_too_wide(self):
+        # Range is 2.5 (3.5-6.0); 80% of that is 2.0, so a P10-P90 span of
+        # exactly 2.0 should not trip the ">" threshold.
+        percentiles = [
+            Percentile(percentile=0.10, value=3.75),
+            Percentile(percentile=0.50, value=4.5),
+            Percentile(percentile=0.90, value=5.75),
+        ]
+        assert percentile_band_too_wide(percentiles, GAS_PRICE_NUMERIC_QUESTION) is False
+
+    def test_missing_p10_or_p90_is_not_flagged(self):
+        percentiles = [Percentile(percentile=0.50, value=4.2)]
+        assert percentile_band_too_wide(percentiles, GAS_PRICE_NUMERIC_QUESTION) is False
+
+    def test_works_on_date_questions_too(self):
+        percentiles = [
+            Percentile(percentile=0.10, value=_ts("2022-06-01")),
+            Percentile(percentile=0.50, value=_ts("2024-11-01")),
+            Percentile(percentile=0.90, value=_ts("2027-04-01")),
+        ]
+        assert percentile_band_too_wide(percentiles, UKRAINE_DATE_QUESTION) is True

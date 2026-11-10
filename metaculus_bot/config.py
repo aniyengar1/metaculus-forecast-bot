@@ -176,6 +176,20 @@ class Config:
     reforecast_staleness_days: int = 7
     max_reforecasts_per_day: int = 5
 
+    # Market Pulse Challenge (market-pulse-26q4). Enabled 2026-11-09 --
+    # bots are included in this tournament's bot leaderboard (confirmed via
+    # the tournament API's bot_leaderboard_status=="include"), it's
+    # spot-scored like MiniBench, and had 11 real open questions (7
+    # numeric, 4 discrete, no binary/MC) as of enablement. Re-forecast
+    # cadence is tighter than seasonal's 7-day default (3 days) since the
+    # task here explicitly asked for every-3-days coverage, not a
+    # rarely-fires safety net -- kept as its own fields (not reusing
+    # reforecast_staleness_days/max_reforecasts_per_day above) so tuning one
+    # tournament's cadence can never accidentally change the other's.
+    enable_market_pulse_tournament: bool = True
+    market_pulse_reforecast_staleness_days: int = 3
+    market_pulse_max_reforecasts_per_day: int = 5
+
     # Calibration (applied to final binary probability only)
     calibration_k: float = 1.0
     calibration_clip_min: float = 0.02
@@ -219,6 +233,9 @@ def load_config() -> Config:
         minibench_quota_reserve=_get_int("MINIBENCH_QUOTA_RESERVE", 5),
         reforecast_staleness_days=_get_int("REFORECAST_STALENESS_DAYS", 7),
         max_reforecasts_per_day=_get_int("MAX_REFORECASTS_PER_DAY", 5),
+        enable_market_pulse_tournament=_get_bool("ENABLE_MARKET_PULSE_TOURNAMENT", True),
+        market_pulse_reforecast_staleness_days=_get_int("MARKET_PULSE_REFORECAST_STALENESS_DAYS", 3),
+        market_pulse_max_reforecasts_per_day=_get_int("MARKET_PULSE_MAX_REFORECASTS_PER_DAY", 5),
         calibration_k=_get_float("CALIBRATION_K", 1.0),
         calibration_clip_min=_get_float("CALIBRATION_CLIP_MIN", 0.02),
         calibration_clip_max=_get_float("CALIBRATION_CLIP_MAX", 0.98),

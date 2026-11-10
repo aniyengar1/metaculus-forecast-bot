@@ -1,0 +1,89 @@
+name: Forecast on Market Pulse
+
+# Market Pulse Challenge 26Q4 (market-pulse-26q4) only -- see
+# run_bot_on_minibench.yaml / run_bot_on_seasonal.yaml for the other two.
+# Enabled 2026-11-09 (ENABLE_MARKET_PULSE_TOURNAMENT defaults True in
+# metaculus_bot/config.py): bots are included in this tournament's bot
+# leaderboard (confirmed via the tournament API's
+# bot_leaderboard_status=="include"), and it's spot-scored like MiniBench.
+# 11 real open questions as of enablement (7 numeric, 4 discrete, no
+# binary/MC this cycle).
+#
+# Re-forecasting every open question every 3 days (capped per day, see
+# cfg.market_pulse_max_reforecasts_per_day) is the actual per-question
+# cadence this tournament asked for -- the 15-min poll below only controls
+# how promptly a newly-opened question gets picked up, same as the other
+# two workflows' poll cadence has nothing to do with their own re-forecast
+# staleness windows.
+#
+# Offset by 11 min from MiniBench (:00/:15/:30/:45) and 4 min from seasonal
+# (:07/:22/:37/:52) so all three interleave on the shared concurrency group
+# below instead of colliding.
+#
+# Concurrency group is explicitly shared with run_bot_on_minibench.yaml and
+# run_bot_on_seasonal.yaml (not the default ${{ github.workflow }}) so none
+# of the three ever race on the data branch -- MiniBench quota priority is
+# enforced in code (main.py's minibench_reserve), not by run ordering here.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "11,26,41,56 * * * *"
+
+concurrency:
+  group: metaculus-bot-forecast
+  cancel-in-progress: false
+
+# Needed to push the updated forecast DB to the `data` branch.
+permissions:
+  contents: write
+
+jobs:
+  forecast_job:
+    runs-on: ubuntu-latest
+    # See run_bot_on_minibench.yaml -- same reasoning, same shared
+    # concurrency group and backup poller.
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: bash scripts/install_dependencies_with_retry.sh
+      - name: Restore forecast DB from data branch
+        run: bash scripts/restore_data_branch.sh
+      - name: Run bot (Market Pulse only)
+        run: poetry run python main.py --mode tournament --target market_pulse --publish
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
+          ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+          ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          # Optional: raises the EIA gas-price direct-data fetch (see
+          # metaculus_bot/data_index.py) off the shared public DEMO_KEY,
+          # which is fine but rate-limited. Free key:
+          # https://www.eia.gov/opendata/register.php
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          # Optional operational overrides -- set as repo Variables (not
+          # Secrets) if you want to change these without a code change.
+          # Empty/unset falls back to the code default in config.py.
+          MAX_COST_PER_DAY: ${{ vars.MAX_COST_PER_DAY }}
+          MAX_QUESTIONS_PER_DAY_CEILING: ${{ vars.MAX_QUESTIONS_PER_DAY_CEILING }}
+          ENABLE_MARKET_PULSE_TOURNAMENT: ${{ vars.ENABLE_MARKET_PULSE_TOURNAMENT }}
+          MINIBENCH_QUOTA_RESERVE: ${{ vars.MINIBENCH_QUOTA_RESERVE }}
+          MARKET_PULSE_REFORECAST_STALENESS_DAYS: ${{ vars.MARKET_PULSE_REFORECAST_STALENESS_DAYS }}
+          MARKET_PULSE_MAX_REFORECASTS_PER_DAY: ${{ vars.MARKET_PULSE_MAX_REFORECASTS_PER_DAY }}
+      - name: Persist forecast DB to data branch
+        if: always()
+        run: bash scripts/persist_data_branch.sh
