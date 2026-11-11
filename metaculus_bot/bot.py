@@ -24,6 +24,7 @@ prediction per question (a no-op pass-through).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -319,7 +320,7 @@ class FutureEvalBot(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         self._check_budget_or_raise(question)
         summarizer_llm = self.get_llm("parser", "llm")
-        summary = await research.gather_research(
+        summary, market_matches = await research.gather_research(
             question, self.cfg, self.db_conn, summarizer_llm
         )
         quality, quality_reason = assess_research_quality(summary)
@@ -330,6 +331,13 @@ class FutureEvalBot(ForecastBot):
             "raw_model_outputs": [],
             "research_quality": quality,
             "guard_fired": False,  # set True below iff a forecast method actually applies the guard
+            # For later analysis of whether market-anchored forecasts score
+            # better (task: log matched/platform/price at research time).
+            "market_matched": bool(market_matches),
+            "market_platform": ",".join(m.platform for m in market_matches) or None,
+            "market_price_at_research": (
+                json.dumps({m.platform: m.price_yes for m in market_matches}) if market_matches else None
+            ),
         }
         return summary
 
@@ -354,6 +362,8 @@ class FutureEvalBot(ForecastBot):
 
             Your research assistant says:
             {research_text}
+
+            If your research includes a matched prediction-market price (Polymarket/Kalshi), a liquid market's price is a strong anchor -- deviate from it only with a clearly stated reason. A market flagged as low-liquidity is a weak signal and should be weighted accordingly, not treated as an anchor.
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -458,6 +468,8 @@ class FutureEvalBot(ForecastBot):
 
             Your research assistant says:
             {research_text}
+
+            If your research includes a matched prediction-market price (Polymarket/Kalshi), a liquid market's price is a strong anchor -- deviate from it only with a clearly stated reason. A market flagged as low-liquidity is a weak signal and should be weighted accordingly, not treated as an anchor.
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -587,6 +599,8 @@ class FutureEvalBot(ForecastBot):
             Your research assistant says:
             {research_text}
 
+            If your research includes a matched prediction-market price (Polymarket/Kalshi), a liquid market's price is a strong anchor -- deviate from it only with a clearly stated reason. A market flagged as low-liquidity is a weak signal and should be weighted accordingly, not treated as an anchor.
+
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
             {lower_msg}
@@ -637,6 +651,8 @@ class FutureEvalBot(ForecastBot):
 
             Your research assistant says:
             {research_text}
+
+            If your research includes a matched prediction-market price (Polymarket/Kalshi), a liquid market's price is a strong anchor -- deviate from it only with a clearly stated reason. A market flagged as low-liquidity is a weak signal and should be weighted accordingly, not treated as an anchor.
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 

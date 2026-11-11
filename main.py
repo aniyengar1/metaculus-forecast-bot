@@ -596,6 +596,9 @@ async def _run(args: argparse.Namespace) -> int:
                 status="ok",
                 research_quality=debug.get("research_quality"),
                 guard_fired=debug.get("guard_fired"),
+                market_matched=debug.get("market_matched"),
+                market_platform=debug.get("market_platform"),
+                market_price_at_research=debug.get("market_price_at_research"),
             )
             if question.id_of_question is not None:
                 db.mark_question_forecasted(conn, question.id_of_question)

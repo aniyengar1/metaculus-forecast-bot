@@ -38,7 +38,10 @@ CREATE TABLE IF NOT EXISTS forecasts (
     status TEXT NOT NULL,
     error_message TEXT,
     research_quality TEXT,
-    guard_fired INTEGER
+    guard_fired INTEGER,
+    market_matched INTEGER,
+    market_platform TEXT,
+    market_price_at_research TEXT
 );
 
 CREATE TABLE IF NOT EXISTS resolutions (
@@ -106,6 +109,9 @@ _FORECASTS_TABLE_MIGRATIONS = [
     ("tournament", "TEXT"),
     ("research_quality", "TEXT"),
     ("guard_fired", "INTEGER"),
+    ("market_matched", "INTEGER"),
+    ("market_platform", "TEXT"),
+    ("market_price_at_research", "TEXT"),
 ]
 
 _RESOLUTIONS_TABLE_MIGRATIONS = [
@@ -162,6 +168,9 @@ def log_forecast(
     error_message: str | None = None,
     research_quality: str | None = None,
     guard_fired: bool | None = None,
+    market_matched: bool | None = None,
+    market_platform: str | None = None,
+    market_price_at_research: str | None = None,
 ) -> int:
     cur = conn.execute(
         """
@@ -170,8 +179,9 @@ def log_forecast(
             question_url, research_summary, raw_model_outputs, aggregate_value,
             post_calibration_value, submitted_value, dry_run, models_used,
             n_runs, cost_usd, estimated_cost_usd, tournament, status, error_message,
-            research_quality, guard_fired
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            research_quality, guard_fired, market_matched, market_platform,
+            market_price_at_research
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
@@ -195,6 +205,9 @@ def log_forecast(
             error_message,
             research_quality,
             None if guard_fired is None else (1 if guard_fired else 0),
+            None if market_matched is None else (1 if market_matched else 0),
+            market_platform,
+            market_price_at_research,
         ),
     )
     conn.commit()

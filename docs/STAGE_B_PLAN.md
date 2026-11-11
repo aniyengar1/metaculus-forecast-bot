@@ -1348,3 +1348,86 @@ graceful-failure on a monkeypatched broken fetch -- no live network calls
 in CI), `tests/test_sanity_guard.py` (new `TestPercentileBandTooWide`
 class), and `tests/test_reforecast.py` (new tournament-filtered
 `count_reforecasts_today` case). 171/171 tests pass, pyflakes clean.
+
+## Prediction-market matching (Polymarket + Kalshi), 2026-11-10
+
+`metaculus_bot/prediction_markets.py`, no new API keys -- both platforms'
+read-only market data is public. For each question (except pure
+data-index ones, see below), searches both platforms and keeps at most
+one match per platform, only if it clears a confidence gate:
+
+- **Polymarket**: `gamma-api.polymarket.com/public-search?q=<query>` --
+  the only one of the two with a real text-search endpoint, so it's
+  queried per-question (cached per distinct query string within the run).
+- **Kalshi**: has no equivalent full-text search, so its entire open-
+  events catalogue is fetched once per run (`/events?status=open&
+  with_nested_markets=true`, paginated, capped at 5 pages/1000 events)
+  and reused for every question's matching -- the "cache market search
+  results within a run" requirement, implemented differently per
+  platform because the platforms' own APIs are shaped differently, not
+  because one cache is more "correct" than the other.
+
+**Matching**: token-Jaccard overlap between the Metaculus question's text
++ resolution criteria and the candidate market's title (`_title_overlap`,
+stopword-filtered), combined 70/30 with a close-date proximity score
+(`_date_proximity`, full credit same-day tapering to zero at 90+ days
+apart, neutral 0.5 if either date is missing -- a missing date never by
+itself creates or kills a match). Requires *both* `_MIN_TITLE_OVERLAP`
+(0.25) and `_MIN_COMBINED_SCORE` (0.40) -- topic+date proximity alone,
+without real title overlap, is never enough. Both thresholds are hand-
+tuned against a handful of real questions while building this, not fit to
+labeled data; `market_matched`/`market_platform` logging below exists
+partly so a future review can check whether they need adjusting.
+
+**Research summary integration**: appended *after* LLM summarization
+(same rationale as the direct-data block in the research-quality-guard
+section above) -- `[Prediction market match: polymarket (match score
+0.56) -- "..." -- Yes price 5.5%, 24h volume $24,393, liquidity $117,411,
+closes 2027-01-01, liquid -- treat as a strong anchor, deviate only with
+a stated reason. <url>]` for a liquid match, or the same with "LOW
+LIQUIDITY -- weak signal, weight accordingly" when `liquidity_usd` or
+`volume_24h_usd` is under `_LOW_LIQUIDITY_USD` ($1,000; Kalshi's
+contract-count volume/open-interest are treated as an approximate dollar
+figure at the $1 notional-per-contract rate its own API describes, not
+an exact one). Both platforms' matches are included when both exist.
+Confirmed live (2026-11-10): "Will Bitcoin reach $100,000 by December
+31, 2026?" matched a real, liquid Polymarket market (score 0.56, 5.5%
+Yes, $117k liquidity) -- see the research summary quoted above.
+
+**Prompt change**: one sentence added to all four prompts (binary, MC,
+numeric, date -- the same insertion point as the research-quality
+section's wording above, so it was a single `replace_all` edit) telling
+the model a liquid matched market's price is a strong anchor to deviate
+from only with a stated reason, and a low-liquidity one is a weak signal.
+
+**Skip logic**: `should_skip_market_matching` reuses
+`data_index.find_matching_series` directly rather than keeping a second
+keyword list in sync with it -- a pure data-index question (ENSO/ONI, EIA
+gas price) already has an exact authoritative number, so spending a
+search on a betting market asking the same thing adds noise, not signal.
+
+**Logging**: `gather_research` now returns `(text, market_matches)`
+instead of just `text` (its one caller, `bot.py`'s `run_research`, is the
+only thing that changed signature-wise) so matched/platform/price can be
+logged without re-parsing the research text to recover data it already
+had structured. Three new `forecasts` columns: `market_matched`
+(bool), `market_platform` (comma-separated, e.g. `"polymarket,kalshi"`
+when both matched), `market_price_at_research` (JSON
+`{"polymarket": 0.55, ...}`) -- there specifically to let a future review
+measure whether market-anchored forecasts actually score better, which
+isn't answerable yet (no resolved questions have gone through this path).
+
+**Automation note** (Metaculus's "no human in the loop" rule): documented
+directly in `prediction_markets.py`'s module docstring, not just here --
+the search query, matching/scoring, and price lookup are fully automated
+with no per-question human review or override anywhere in the file,
+which is what the rule actually requires (a human previewing/hand-tuning
+an open question's forecast is prohibited; an identical automated
+research step run the same way for every question is not).
+
+Covered by `tests/test_prediction_markets.py` (26 tests: tokenize/overlap/
+date-proximity math, both platforms' market parsing incl. malformed/
+closed/inactive-market exclusion, confidence gating, per-run caching for
+both platforms via monkeypatched `requests.get`, and the research-block
+text for liquid vs. low-liquidity matches -- no live network calls in
+CI). 197/197 tests pass, pyflakes clean.

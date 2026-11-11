@@ -20,8 +20,9 @@ from datetime import datetime, timezone
 
 from forecasting_tools import GeneralLlm, MetaculusQuestion, clean_indents
 
-from metaculus_bot import data_index, db, provider_quota
+from metaculus_bot import data_index, db, prediction_markets, provider_quota
 from metaculus_bot.config import Config, asknews_creds_present
+from metaculus_bot.prediction_markets import MarketMatch
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,12 @@ async def gather_research(
     cfg: Config,
     conn: sqlite3.Connection,
     summarizer_llm: GeneralLlm,
-) -> str:
+) -> tuple[str, list[MarketMatch]]:
+    """Returns (research_text, market_matches) -- the matches are returned
+    separately (not just baked into the text) so the caller can log
+    matched/platform/price per question (see bot.py's run_research) without
+    re-parsing the research text to recover structured data it already
+    had."""
     raw, source = await _get_raw_research(question, cfg, conn)
 
     prompt = clean_indents(
@@ -162,4 +168,19 @@ async def gather_research(
     direct_data = data_index.fetch_direct_data(question.question_text, question.resolution_criteria)
     direct_block = f"\n\n{direct_data.as_research_block()}" if direct_data else ""
 
-    return f"[research source: {source}]\n{summary}{direct_block}"
+    # Same "appended after summarization, untouched by the LLM" rationale
+    # as direct_data above -- a live price/volume/liquidity number must
+    # survive verbatim, not get paraphrased into something vaguer. Skipped
+    # entirely for pure data-index questions (see
+    # prediction_markets.should_skip_market_matching): those already have
+    # an exact authoritative number, so a betting-market search can only
+    # add noise, not signal, for that specific case.
+    market_matches: list[MarketMatch] = []
+    if not prediction_markets.should_skip_market_matching(question.question_text, question.resolution_criteria):
+        market_matches = prediction_markets.find_market_matches(
+            question.question_text, question.resolution_criteria, question.close_time
+        )
+    market_block = "".join(f"\n\n{m.as_research_block()}" for m in market_matches)
+
+    research_text = f"[research source: {source}]\n{summary}{direct_block}{market_block}"
+    return research_text, market_matches
