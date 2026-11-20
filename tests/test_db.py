@@ -48,6 +48,37 @@ def test_migration_adds_column_to_pre_existing_resolutions_table():
     assert "raw_ensemble_prob" in columns_after
 
 
+def test_forecasts_table_has_status_quo_flag_column_after_migration():
+    conn = _conn()
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(forecasts)")}
+    assert "status_quo_flag" in columns
+
+
+def test_log_forecast_round_trips_status_quo_flag():
+    conn = _conn()
+    db.log_forecast(
+        conn,
+        question_id=1,
+        post_id=1,
+        question_title="Will X happen by 2027?",
+        question_type="BinaryQuestion",
+        question_url="https://example.com",
+        research_summary="",
+        raw_model_outputs=[],
+        aggregate_value=0.5,
+        post_calibration_value=0.5,
+        submitted_value=0.5,
+        dry_run=True,
+        models_used=["m1"],
+        n_runs=1,
+        cost_usd=0.0,
+        status="ok",
+        status_quo_flag=True,
+    )
+    row = conn.execute("SELECT status_quo_flag FROM forecasts").fetchone()
+    assert row[0] == 1
+
+
 def test_record_resolution_inserts_new_row():
     conn = _conn()
     db.record_resolution(

@@ -79,6 +79,7 @@ from metaculus_bot.research_quality import (
     widen_numeric_distribution,
 )
 from metaculus_bot.sanity_guard import check_numeric_or_date_distribution, percentile_band_too_wide
+from metaculus_bot.status_quo import STATUS_QUO_PROMPT_ADDITION, is_status_quo_question
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +349,9 @@ class FutureEvalBot(ForecastBot):
 
     @staticmethod
     def _binary_prompt(question: BinaryQuestion, research_text: str) -> str:
+        status_quo_note = (
+            STATUS_QUO_PROMPT_ADDITION if is_status_quo_question(question.question_text) else ""
+        )
         return clean_indents(
             f"""
             You are a professional forecaster interviewing for a job.
@@ -367,6 +371,8 @@ class FutureEvalBot(ForecastBot):
             {research_text}
 
             If your research includes a matched prediction-market price (Polymarket/Kalshi), a liquid market's price is a strong anchor -- deviate from it only with a clearly stated reason. A market flagged as low-liquidity is a weak signal and should be weighted accordingly, not treated as an anchor.
+
+            {status_quo_note}
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
@@ -446,6 +452,7 @@ class FutureEvalBot(ForecastBot):
             calibrated = shrink_binary_toward_half(calibrated)
             self.debug_log[key]["guard_fired"] = True
         self.debug_log[key]["no_direct_evidence"] = no_evidence
+        self.debug_log[key]["status_quo_flag"] = is_status_quo_question(question.question_text)
 
         self._record_debug(question, results, aggregate, calibrated)
         combined_reasoning = self._combine_reasoning(results)
