@@ -15,6 +15,7 @@ from metaculus_bot.research_quality import (
     assess_research_quality,
     binary_clip_bounds,
     flatten_mc_toward_uniform,
+    has_implausible_subdollar_commodity_price,
     has_no_direct_evidence,
     shrink_binary_toward_half,
     widen_numeric_distribution,
@@ -94,6 +95,60 @@ class TestAssessResearchQuality:
         quality, reason = assess_research_quality(f"[research source: asknews]\n{body}")
         assert quality == "ok"
         assert "substantive" in reason
+
+
+class TestHasImplausibleSubdollarCommodityPrice:
+    # Real research text from the 2026-11-03 USDA egg-price loss (-33.0
+    # peer): the actual USDA report said 73 cents/dozen, but research read
+    # "$0.35 per dozen" off the source and converted it (correctly, as a
+    # dollars-to-cents conversion) to "35" -- the wrong number went in
+    # before any unit conversion happened.
+    _EGG_BUG_TEXT_NO_DATE = (
+        "[research source: duckduckgo_fallback]\n"
+        "**Research Summary:**\n"
+        "* **Target Report:** USDA AMS \"Egg Markets Overview\" (Report 3725).\n"
+        "* **Specific Price Data Point:** The exact sentence covering the "
+        "target metric (\"Wholesale prices for national trading of truck "
+        "lot quantities of graded, loose, white Large shell eggs\") is "
+        "recorded in the primary source document at **$0.35 per dozen**.\n"
+        "* **Resolution Value:** Expressed in cents per dozen as required "
+        "by the resolution criteria, the reported price is **35**."
+    )
+    # Same text, but with an explicit date mentioned elsewhere -- passes
+    # assess_research_quality's length/date/failure-phrase checks as "ok"
+    # before this module's fix (confirmed against the pre-fix code during
+    # development); this check must catch it regardless.
+    _EGG_BUG_TEXT_WITH_DATE = _EGG_BUG_TEXT_NO_DATE.replace(
+        "Report 3725).", "Report 3725) dated November 13, 2026."
+    )
+
+    def test_detects_the_real_egg_price_bug_text(self):
+        assert has_implausible_subdollar_commodity_price(self._EGG_BUG_TEXT_NO_DATE) is True
+
+    def test_assess_research_quality_flags_undated_version_as_weak(self):
+        quality, reason = assess_research_quality(self._EGG_BUG_TEXT_NO_DATE)
+        assert quality == "weak"
+
+    def test_assess_research_quality_flags_dated_version_as_weak_too(self):
+        # The key regression: a date mention alone must not be enough to
+        # wave this through as "ok".
+        quality, reason = assess_research_quality(self._EGG_BUG_TEXT_WITH_DATE)
+        assert quality == "weak"
+        assert "sub-$1" in reason
+
+    def test_normal_dollar_amount_is_not_flagged(self):
+        text = "The wholesale price for graded loose eggs was $2.15 per dozen as of November 2026."
+        assert has_implausible_subdollar_commodity_price(text) is False
+
+    def test_subdollar_amount_without_per_unit_context_is_not_flagged(self):
+        # A sub-$1 figure that isn't anywhere near a per-unit word (e.g. a
+        # stock price move, a tax rate) shouldn't trip this -- it's
+        # specifically about implausible per-unit commodity quotes.
+        text = "The company's stock rose by $0.35 after the earnings call in November 2026."
+        assert has_implausible_subdollar_commodity_price(text) is False
+
+    def test_empty_text_is_not_flagged(self):
+        assert has_implausible_subdollar_commodity_price("") is False
 
 
 class TestHasNoDirectEvidence:

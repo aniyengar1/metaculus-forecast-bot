@@ -56,6 +56,35 @@ _DATE_PATTERN = re.compile(r"\b(19|20)\d{2}\b|\b\d{4}-\d{2}-\d{2}\b")
 
 _SOURCE_TAG_PATTERN = re.compile(r"^\[research source:[^\]]*\]\s*", re.IGNORECASE)
 
+# The 2026-11-03 USDA egg-price loss (-33.0 peer, numeric question): research
+# read "$0.35 per dozen" off the source page and (correctly, as far as that
+# step goes) converted it to "35" cents -- but $0.35/dozen is itself
+# essentially never real for a wholesale commodity quoted "per dozen/unit/
+# pound/etc" (the actual report said 73 cents). This has a date mentioned
+# elsewhere in the same text (the question's own deadline), so it otherwise
+# passes every check above as "ok" -- this check exists specifically to
+# catch that gap: a sub-$1 figure is implausible for this unit regardless of
+# how dated/substantive the surrounding research is.
+_SUBDOLLAR_PRICE_PATTERN = re.compile(r"\$0\.\d{2}\b")
+_PER_UNIT_WORDS = ("dozen", "pound", "bushel", "gallon", "carton", "per unit")
+_PRICE_WINDOW_CHARS = 40
+
+
+def has_implausible_subdollar_commodity_price(research_summary: str) -> bool:
+    """True if the research text quotes a sub-$1 dollar figure (e.g.
+    "$0.35") within a short window of a wholesale per-unit word like "per
+    dozen" -- essentially never a real price for those units, and a strong
+    signal the research misread the source (wrong row/column, stale page,
+    OCR slip) rather than a genuine data point."""
+    body = _SOURCE_TAG_PATTERN.sub("", research_summary or "")
+    lowered = body.lower()
+    for match in _SUBDOLLAR_PRICE_PATTERN.finditer(body):
+        start, end = match.span()
+        window = lowered[max(0, start - _PRICE_WINDOW_CHARS) : end + _PRICE_WINDOW_CHARS]
+        if any(word in window for word in _PER_UNIT_WORDS):
+            return True
+    return False
+
 
 def assess_research_quality(research_summary: str) -> tuple[str, str]:
     """Returns (quality, reason), quality in {"weak", "ok"}."""
@@ -69,6 +98,8 @@ def assess_research_quality(research_summary: str) -> tuple[str, str]:
         return "weak", f"research summary is very short ({len(body)} chars)"
     if any(phrase in lowered for phrase in _FAILURE_PHRASES):
         return "weak", "research source reported no results"
+    if has_implausible_subdollar_commodity_price(text):
+        return "weak", "research cites an implausible sub-$1 per-unit commodity price (likely a misread)"
     if not _DATE_PATTERN.search(body):
         return "weak", "no dated source found anywhere in the research"
     return "ok", "research has substantive, dated content"
