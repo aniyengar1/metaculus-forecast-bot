@@ -54,7 +54,7 @@ from forecasting_tools.data_models.numeric_report import NumericReport
 
 from metaculus_bot import data_index, db, research
 from metaculus_bot.aggregation import (
-    aggregate_binary_log_odds,
+    aggregate_binary_log_odds_weighted,
     aggregate_multiple_choice_median,
     blend_numeric_distributions,
     build_pchip_numeric_distribution,
@@ -440,7 +440,9 @@ class FutureEvalBot(ForecastBot):
                 f"{[r.error for r in results]}"
             )
 
-        aggregate = aggregate_binary_log_odds([r.value for r in successes])
+        aggregate = aggregate_binary_log_odds_weighted(
+            [(r.model, r.value) for r in successes], self.cfg.model_weights
+        )
 
         key = _question_key(question)
         quality = self.debug_log.get(key, {}).get("research_quality")

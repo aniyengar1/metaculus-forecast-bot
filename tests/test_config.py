@@ -6,7 +6,7 @@ provider diversity for no reason. Fix: slot-based structure, one model per
 slot. See docs/STAGE_B_PLAN.md "Slot-based model selection"."""
 from __future__ import annotations
 
-from metaculus_bot.config import DEFAULT_MODEL_SLOTS, DEFAULT_OPENROUTER_FALLBACK_POOL
+from metaculus_bot.config import DEFAULT_MODEL_SLOTS, DEFAULT_MODEL_WEIGHTS, DEFAULT_OPENROUTER_FALLBACK_POOL, load_config
 from metaculus_bot.model_naming import provider_of
 
 
@@ -35,3 +35,24 @@ def test_openrouter_fallback_pool_has_multiple_candidates():
     assert len(DEFAULT_OPENROUTER_FALLBACK_POOL) >= 2
     for model in DEFAULT_OPENROUTER_FALLBACK_POOL:
         assert provider_of(model) == "openrouter"
+
+
+def test_default_model_weights_cover_every_slot_candidate_with_resolved_history():
+    """Every slot candidate has resolved binary history by now (unlike two
+    of the four OpenRouter fallback pool models, which this dict
+    legitimately omits -- a model with zero resolved history correctly
+    defaults to the equal-weight baseline of 1.0 at runtime rather than
+    needing an explicit entry here)."""
+    for slot in DEFAULT_MODEL_SLOTS:
+        for model in slot:
+            assert model in DEFAULT_MODEL_WEIGHTS, f"{model} has no entry in DEFAULT_MODEL_WEIGHTS"
+
+
+def test_default_model_weights_all_positive():
+    for model, weight in DEFAULT_MODEL_WEIGHTS.items():
+        assert weight > 0, f"{model} has a non-positive weight"
+
+
+def test_load_config_wires_model_weights():
+    cfg = load_config()
+    assert cfg.model_weights == DEFAULT_MODEL_WEIGHTS

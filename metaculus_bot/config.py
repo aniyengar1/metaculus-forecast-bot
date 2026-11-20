@@ -66,6 +66,33 @@ DEFAULT_PARSER_MODEL_POOL = [
 ]
 DEFAULT_PARSER_MODEL = "gemini/gemini-3.5-flash-lite"
 
+# Per-model binary-ensemble weights: inverse-Brier, shrunk toward equal
+# (shrink = n/(n+30), see metaculus_bot.aggregation.shrunk_inverse_brier_weight)
+# so a model with under ~15 resolved questions stays close to equal weight
+# regardless of its Brier, and only a model with 40+ resolved questions
+# earns most of its own track record. Computed 2026-11-20 from every
+# resolved binary question at that point:
+#   gemini-3.5-flash     n=8  Brier=0.1837
+#   gemini-3.8-flash     n=6  Brier=0.1645
+#   groq-120b            n=41 Brier=0.1794
+#   groq-qwen            n=35 Brier=0.1527
+#   openrouter-dots      n=8  Brier=0.2496
+#   openrouter-nvidia    n=16 Brier=0.1845
+# Not recomputed automatically each run -- a stale number here doesn't
+# drift silently; re-derive by hand (scripts/performance_report.py's
+# per-model Brier table + shrunk_inverse_brier_weight) as more questions
+# resolve. A model missing from this dict (never resolved/scored yet, e.g.
+# a brand new OpenRouter fallback) defaults to 1.0, the equal-weight
+# baseline shrinkage converges to at n=0 anyway.
+DEFAULT_MODEL_WEIGHTS: dict[str, float] = {
+    "gemini/gemini-3.5-flash": 1.9355,
+    "gemini/gemini-3.8-flash": 1.8465,
+    "groq/openai/gpt-oss-120b": 3.6414,
+    "groq/qwen/qwen3.8-27b": 3.9878,
+    "openrouter/dots-studio/dots-3-note-preview:free": 1.6329,
+    "openrouter/nvidia/nemotron-3-super-120b-a12b:free": 2.5374,
+}
+
 
 def _get_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
@@ -111,6 +138,7 @@ class Config:
     target_ensemble_size: int = 3
     n_runs: int = 3
     parser_model: str = DEFAULT_PARSER_MODEL
+    model_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_MODEL_WEIGHTS))
 
     # Budget guard
     max_cost_per_question: float = 0.40
@@ -218,6 +246,10 @@ def load_config() -> Config:
         target_ensemble_size=_get_int("BOT_TARGET_ENSEMBLE_SIZE", 3),
         n_runs=_get_int("BOT_N_RUNS", 3),
         parser_model=os.getenv("BOT_PARSER_MODEL", DEFAULT_PARSER_MODEL),
+        # Not env-overridable -- same rationale as model_slots above (a
+        # model-name-keyed weight dict doesn't fit the flat comma-separated
+        # format _get_list/_get_float expect).
+        model_weights=dict(DEFAULT_MODEL_WEIGHTS),
         max_cost_per_question=_get_float("MAX_COST_PER_QUESTION", 0.40),
         max_cost_per_day=_get_float("MAX_COST_PER_DAY", 10.0),
         budget_safety_margin=_get_float("BUDGET_SAFETY_MARGIN", 1.3),

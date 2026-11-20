@@ -36,11 +36,14 @@ from forecasting_tools.data_models.numeric_report import NumericReport
 from scipy.interpolate import PchipInterpolator
 
 from metaculus_bot.aggregation import (
+    aggregate_binary_log_odds_weighted,
     blend_numeric_distributions,
     build_pchip_numeric_distribution,
     build_statistical_numeric_distribution,
     floor_and_renormalize_mc,
+    shrunk_inverse_brier_weight,
 )
+from metaculus_bot.calibration import logit
 from metaculus_bot.data_index import DataPoint
 
 
@@ -343,3 +346,61 @@ class TestFloorAndRenormalizeMc:
         assert abs(sum(probs.values()) - 1.0) < 1e-9
         for i in range(9):
             assert probs[f"LONGSHOT_{i}"] >= 0.02 - 1e-9
+
+
+class TestShrunkInverseBrierWeight:
+    def test_zero_history_is_exactly_equal_weight(self):
+        assert shrunk_inverse_brier_weight(brier=0.15, n=0) == pytest.approx(1.0)
+
+    def test_n_equal_to_k_is_exactly_halfway(self):
+        # shrink = n/(n+k) = 0.5 at n=k -- weight is the midpoint of
+        # 1/brier and the equal-weight baseline 1.0.
+        brier = 0.2
+        weight = shrunk_inverse_brier_weight(brier=brier, n=30, k_shrink=30.0)
+        assert weight == pytest.approx(0.5 * (1 / brier) + 0.5 * 1.0)
+
+    def test_large_n_converges_toward_inverse_brier(self):
+        weight = shrunk_inverse_brier_weight(brier=0.2, n=100_000, k_shrink=30.0)
+        assert weight == pytest.approx(1 / 0.2, rel=1e-3)
+
+    def test_lower_brier_gets_higher_weight_at_same_n(self):
+        better = shrunk_inverse_brier_weight(brier=0.15, n=40)
+        worse = shrunk_inverse_brier_weight(brier=0.25, n=40)
+        assert better > worse
+
+    def test_real_data_ranking_matches_review(self):
+        # From the 2026-11-20 performance review: groq-qwen (lowest Brier,
+        # decent n) should end up the highest-weighted model, dots (worst
+        # Brier, low n) the lowest.
+        qwen = shrunk_inverse_brier_weight(brier=0.1527, n=35)
+        dots = shrunk_inverse_brier_weight(brier=0.2496, n=8)
+        assert qwen > dots
+
+
+class TestAggregateBinaryLogOddsWeighted:
+    def test_equal_weights_matches_plain_mean_in_logit_space(self):
+        model_values = [("m1", 0.2), ("m2", 0.5), ("m3", 0.8)]
+        weights = {"m1": 1.0, "m2": 1.0, "m3": 1.0}
+        result = aggregate_binary_log_odds_weighted(model_values, weights)
+        expected_logit = sum(logit(v) for _, v in model_values) / 3
+        assert logit(result) == pytest.approx(expected_logit)
+
+    def test_higher_weighted_model_pulls_result_toward_it(self):
+        model_values = [("strong", 0.9), ("weak", 0.1)]
+        equal = aggregate_binary_log_odds_weighted(model_values, {"strong": 1.0, "weak": 1.0})
+        skewed = aggregate_binary_log_odds_weighted(model_values, {"strong": 10.0, "weak": 1.0})
+        assert skewed > equal  # pulled toward the heavily-weighted "strong" model's 0.9
+
+    def test_unknown_model_defaults_to_equal_weight(self):
+        model_values = [("known", 0.8), ("brand_new", 0.8)]
+        result = aggregate_binary_log_odds_weighted(model_values, {"known": 5.0})
+        # Both models agree at 0.8 regardless of weight -- result must be 0.8.
+        assert result == pytest.approx(0.8)
+
+    def test_normalizes_across_whatever_models_are_actually_present(self):
+        # Same relative weights (2:1), different absolute scale -- result
+        # should be identical either way since normalization cancels scale.
+        model_values = [("a", 0.3), ("b", 0.7)]
+        r1 = aggregate_binary_log_odds_weighted(model_values, {"a": 2.0, "b": 1.0})
+        r2 = aggregate_binary_log_odds_weighted(model_values, {"a": 200.0, "b": 100.0})
+        assert r1 == pytest.approx(r2)

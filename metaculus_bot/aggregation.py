@@ -54,6 +54,40 @@ def aggregate_binary_log_odds(probabilities: list[float]) -> float:
     return sigmoid(median_logit)
 
 
+# How fast a model's weight grows into its own inverse-Brier value as its
+# resolved-question count n grows -- shrink = n/(n+K), so n==K is exactly
+# halfway. 30 chosen so a model needs real history (dozens of resolved
+# questions) before its own track record dominates; below ~15 resolved
+# questions it stays close to equal weight regardless of Brier.
+DEFAULT_WEIGHT_SHRINK_K = 30.0
+
+
+def shrunk_inverse_brier_weight(brier: float, n: int, k_shrink: float = DEFAULT_WEIGHT_SHRINK_K) -> float:
+    """Inverse-Brier weight (1/brier), shrunk toward the equal-weight
+    baseline of 1.0 by shrink = n/(n+k_shrink): n=0 gives exactly 1.0
+    (fully equal), n >> k_shrink converges to 1/brier (fully earned).
+    `brier` must be > 0 (a real Brier score on resolved binaries always is,
+    short of a model that's never anything but perfectly wrong)."""
+    shrink = n / (n + k_shrink)
+    return shrink / brier + (1 - shrink)
+
+
+def aggregate_binary_log_odds_weighted(
+    model_values: list[tuple[str, float]], weights: dict[str, float]
+) -> float:
+    """Weighted mean in log-odds space. Weights are normalized to sum to 1
+    among just the models actually present in this run -- so a run that
+    fell back to an OpenRouter model for one slot still produces a valid,
+    fully-weighted aggregate, not a partial one. A model missing from
+    `weights` (never resolved/scored yet) defaults to 1.0, the same value
+    shrunk_inverse_brier_weight converges to at n=0."""
+    raw_weights = [weights.get(model, 1.0) for model, _ in model_values]
+    total_weight = sum(raw_weights)
+    logits = [logit(value) for _, value in model_values]
+    weighted_logit = sum(w * lg for w, lg in zip(raw_weights, logits)) / total_weight
+    return sigmoid(weighted_logit)
+
+
 def aggregate_multiple_choice_median(
     option_lists: list[PredictedOptionList],
 ) -> PredictedOptionList:
