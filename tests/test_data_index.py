@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from metaculus_bot import data_index
-from metaculus_bot.data_index import DataPoint, DataSeries, fetch_direct_data, find_matching_series
+from metaculus_bot.data_index import DataPoint, DataSeries, _fetch_eia_gas_price, _fetch_oni, fetch_direct_data, find_matching_series
 
 
 class TestFindMatchingSeries:
@@ -82,3 +82,70 @@ def test_real_series_registry_still_matches_known_question_shapes(question_text)
     """Not a network test -- just confirms the real (unpatched) _SERIES list
     still recognizes the two question shapes this was built for."""
     assert find_matching_series(question_text) is not None
+
+
+class _FakeResponse:
+    def __init__(self, text: str = "", json_data: dict | None = None):
+        self._text = text
+        self._json = json_data
+
+    def raise_for_status(self) -> None:
+        pass
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    def json(self) -> dict:
+        return self._json
+
+
+# 13 monthly ONI anomalies alternating +0.10/-0.10 -- an odd count gives an
+# even number of consecutive diffs (12), split exactly 6/6 between -0.20
+# and +0.20, so their mean is exactly 0 and pstdev is exactly 0.2 -- a
+# clean, known number rather than something only checkable by eyeballing a
+# real multi-decade file.
+_FAKE_ONI_TEXT = "SEAS YEAR TOTAL ANOM\n" + "\n".join(
+    f"XXX {2000 + i // 12} 27.00 {0.10 if i % 2 == 0 else -0.10:+.2f}" for i in range(13)
+)
+
+
+class TestFetchOniVolatility:
+    def test_populates_numeric_fields_from_full_history(self, monkeypatch):
+        monkeypatch.setattr(data_index.requests, "get", lambda *a, **k: _FakeResponse(text=_FAKE_ONI_TEXT))
+        point = _fetch_oni()
+        assert point.numeric_value == pytest.approx(0.10)  # last of 13 (index 12, even) is +0.10
+        assert point.is_price is False
+        assert point.period_days == pytest.approx(30.44)
+        # 12 diffs split exactly 6/6 between -0.2 and +0.2 -- mean 0, pstdev 0.2 exactly.
+        assert point.volatility == pytest.approx(0.2, abs=1e-9)
+
+    def test_too_few_rows_leaves_volatility_none(self, monkeypatch):
+        short_text = "SEAS YEAR TOTAL ANOM\nXXX 2026 27.00 +0.50\nYYY 2026 27.10 +0.60"
+        monkeypatch.setattr(data_index.requests, "get", lambda *a, **k: _FakeResponse(text=short_text))
+        point = _fetch_oni()
+        assert point.numeric_value == pytest.approx(0.60)
+        assert point.volatility is None
+
+
+_FAKE_EIA_ROWS_DESC = [
+    {"period": f"2026-W{52 - i:02d}", "value": str(4.0 * (1.01**i) if i % 2 == 0 else 4.0 * (0.99**i))}
+    for i in range(10)
+]
+
+
+class TestFetchEiaGasPriceVolatility:
+    def test_populates_numeric_fields_from_history(self, monkeypatch):
+        fake_json = {"response": {"data": _FAKE_EIA_ROWS_DESC}}
+        monkeypatch.setattr(data_index.requests, "get", lambda *a, **k: _FakeResponse(json_data=fake_json))
+        point = _fetch_eia_gas_price()
+        assert point.numeric_value == pytest.approx(float(_FAKE_EIA_ROWS_DESC[0]["value"]))
+        assert point.is_price is True
+        assert point.period_days == pytest.approx(7.0)
+        assert point.volatility is not None and point.volatility > 0
+
+    def test_too_few_rows_leaves_volatility_none(self, monkeypatch):
+        fake_json = {"response": {"data": _FAKE_EIA_ROWS_DESC[:3]}}
+        monkeypatch.setattr(data_index.requests, "get", lambda *a, **k: _FakeResponse(json_data=fake_json))
+        point = _fetch_eia_gas_price()
+        assert point.volatility is None

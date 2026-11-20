@@ -30,11 +30,18 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+import pytest
 from forecasting_tools import DateQuestion, NumericDistribution, NumericQuestion, Percentile, PredictedOption, PredictedOptionList
 from forecasting_tools.data_models.numeric_report import NumericReport
 from scipy.interpolate import PchipInterpolator
 
-from metaculus_bot.aggregation import build_pchip_numeric_distribution, floor_and_renormalize_mc
+from metaculus_bot.aggregation import (
+    blend_numeric_distributions,
+    build_pchip_numeric_distribution,
+    build_statistical_numeric_distribution,
+    floor_and_renormalize_mc,
+)
+from metaculus_bot.data_index import DataPoint
 
 
 def _ts(date_str: str) -> float:
@@ -169,6 +176,131 @@ def test_declared_percentiles_are_monotonically_increasing():
     assert all(b >= a for a, b in zip(percentiles, percentiles[1:]))
     values = [p.value for p in dist.declared_percentiles]
     assert all(b >= a for a, b in zip(values, values[1:]))
+
+
+GAS_PRICE_WITH_HORIZON = GAS_PRICE_NUMERIC_QUESTION.model_copy(
+    update={"scheduled_resolution_time": datetime(2026, 12, 1, tzinfo=timezone.utc)}
+)
+_NOW = datetime(2026, 11, 1, tzinfo=timezone.utc)  # 30 days before the horizon above
+
+
+def _price_data_point(numeric_value: float, volatility: float) -> DataPoint:
+    return DataPoint(
+        label="fake price series",
+        value=f"${numeric_value:.3f}",
+        as_of="2026-11-01",
+        source_url="http://example.com",
+        numeric_value=numeric_value,
+        volatility=volatility,
+        period_days=7.0,
+        is_price=True,
+    )
+
+
+class TestBuildStatisticalNumericDistribution:
+    def test_returns_none_without_numeric_fields(self):
+        bare_point = DataPoint(label="x", value="x", as_of="x", source_url="http://example.com")
+        assert build_statistical_numeric_distribution(bare_point, GAS_PRICE_WITH_HORIZON, now=_NOW) is None
+
+    def test_median_matches_last_value_for_a_price_series(self):
+        point = _price_data_point(4.2, volatility=0.02)
+        dist = build_statistical_numeric_distribution(point, GAS_PRICE_WITH_HORIZON, now=_NOW)
+        median = dist.get_percentiles_at_target_heights([0.5])[0].value
+        assert median == pytest.approx(4.2, rel=1e-2)
+
+    def test_band_widens_with_more_volatility(self):
+        tight = build_statistical_numeric_distribution(_price_data_point(4.2, 0.01), GAS_PRICE_WITH_HORIZON, now=_NOW)
+        wide = build_statistical_numeric_distribution(_price_data_point(4.2, 0.08), GAS_PRICE_WITH_HORIZON, now=_NOW)
+        t10, t90 = (p.value for p in tight.get_percentiles_at_target_heights([0.1, 0.9]))
+        w10, w90 = (p.value for p in wide.get_percentiles_at_target_heights([0.1, 0.9]))
+        assert (w90 - w10) > (t90 - t10)
+
+    def test_stays_within_question_bounds(self):
+        # A volatility large enough that the raw log-normal P10 (~3.3) falls
+        # below the question's lower bound (3.5) must clip to the bound
+        # rather than overshoot it.
+        point = _price_data_point(4.2, volatility=0.09)
+        dist = build_statistical_numeric_distribution(point, GAS_PRICE_WITH_HORIZON, now=_NOW)
+        p10, p90 = (p.value for p in dist.get_percentiles_at_target_heights([0.1, 0.9]))
+        assert p10 == pytest.approx(GAS_PRICE_NUMERIC_QUESTION.lower_bound, abs=1e-3)
+        assert p90 <= GAS_PRICE_NUMERIC_QUESTION.upper_bound + 1e-6
+
+    def test_extreme_volatility_falls_back_to_none_instead_of_crashing(self):
+        # Volatility this large pushes several adjacent percentile heights
+        # to the exact same clipped bound value, which produces a CDF too
+        # concentrated for Metaculus's own validation to accept -- no real
+        # series this module tracks is anywhere near this volatile, but the
+        # function must degrade to "use LLM-only" rather than blow up a
+        # question that would otherwise forecast fine.
+        point = _price_data_point(4.2, volatility=5.0)
+        assert build_statistical_numeric_distribution(point, GAS_PRICE_WITH_HORIZON, now=_NOW) is None
+
+    def test_additive_index_series_can_go_negative(self):
+        index_point = DataPoint(
+            label="fake index",
+            value="-0.5",
+            as_of="2026-11-01",
+            source_url="http://example.com",
+            numeric_value=-0.5,
+            volatility=0.3,
+            period_days=30.44,
+            is_price=False,
+        )
+        question = NumericQuestion(
+            id_of_question=99,
+            id_of_post=99,
+            question_text="fake index question",
+            page_url="https://www.metaculus.com/questions/99",
+            upper_bound=3.0,
+            lower_bound=-3.0,
+            open_upper_bound=True,
+            open_lower_bound=True,
+            zero_point=None,
+            scheduled_resolution_time=datetime(2026, 12, 1, tzinfo=timezone.utc),
+        )
+        dist = build_statistical_numeric_distribution(index_point, question, now=_NOW)
+        median = dist.get_percentiles_at_target_heights([0.5])[0].value
+        assert median == pytest.approx(-0.5, abs=0.2)
+
+
+class TestBlendNumericDistributions:
+    def test_blend_lands_between_the_two_inputs(self):
+        stats_dist = build_statistical_numeric_distribution(
+            _price_data_point(5.0, 0.02), GAS_PRICE_WITH_HORIZON, now=_NOW
+        )
+        llm_dist = build_pchip_numeric_distribution(
+            [
+                Percentile(percentile=0.1, value=3.6),
+                Percentile(percentile=0.5, value=3.8),
+                Percentile(percentile=0.9, value=4.0),
+            ],
+            GAS_PRICE_NUMERIC_QUESTION,
+        )
+        blended = blend_numeric_distributions(stats_dist, llm_dist, GAS_PRICE_NUMERIC_QUESTION, stats_weight=0.7)
+        blended_median = blended.get_percentiles_at_target_heights([0.5])[0].value
+        stats_median = stats_dist.get_percentiles_at_target_heights([0.5])[0].value
+        llm_median = llm_dist.get_percentiles_at_target_heights([0.5])[0].value
+        lo, hi = sorted((stats_median, llm_median))
+        assert lo <= blended_median <= hi
+
+    def test_higher_stats_weight_pulls_closer_to_stats(self):
+        stats_dist = build_statistical_numeric_distribution(
+            _price_data_point(5.0, 0.02), GAS_PRICE_WITH_HORIZON, now=_NOW
+        )
+        llm_dist = build_pchip_numeric_distribution(
+            [
+                Percentile(percentile=0.1, value=3.6),
+                Percentile(percentile=0.5, value=3.8),
+                Percentile(percentile=0.9, value=4.0),
+            ],
+            GAS_PRICE_NUMERIC_QUESTION,
+        )
+        blended_70 = blend_numeric_distributions(stats_dist, llm_dist, GAS_PRICE_NUMERIC_QUESTION, stats_weight=0.7)
+        blended_30 = blend_numeric_distributions(stats_dist, llm_dist, GAS_PRICE_NUMERIC_QUESTION, stats_weight=0.3)
+        stats_median = stats_dist.get_percentiles_at_target_heights([0.5])[0].value
+        median_70 = blended_70.get_percentiles_at_target_heights([0.5])[0].value
+        median_30 = blended_30.get_percentiles_at_target_heights([0.5])[0].value
+        assert abs(median_70 - stats_median) < abs(median_30 - stats_median)
 
 
 class TestFloorAndRenormalizeMc:

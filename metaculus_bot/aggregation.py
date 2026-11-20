@@ -16,10 +16,14 @@ Phase 1 research (nostreambot, Panshul42) showed a better approach:
 """
 from __future__ import annotations
 
+import logging
+import math
 import statistics
+from datetime import datetime, timezone
 
 import numpy as np
 from scipy.interpolate import PchipInterpolator
+from scipy.stats import norm
 
 from forecasting_tools import (
     DateQuestion,
@@ -31,8 +35,17 @@ from forecasting_tools import (
 )
 
 from metaculus_bot.calibration import logit, sigmoid
+from metaculus_bot.data_index import DataPoint
+
+logger = logging.getLogger(__name__)
 
 _MIN_PERCENTILE_STEP = 6e-5
+
+# Representative percentile heights used by both the statistical-blend
+# functions below and research_quality.widen_numeric_distribution -- the
+# same spread (P10/20/40/50/60/80/90) every sparse-percentile-manipulation
+# helper in this codebase builds on.
+_BLEND_HEIGHTS = (0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9)
 
 
 def aggregate_binary_log_odds(probabilities: list[float]) -> float:
@@ -218,3 +231,85 @@ def build_pchip_numeric_distribution(
         dense_percentiles, question, standardize_cdf=True
     )
     return final
+
+
+def build_statistical_numeric_distribution(
+    data_point: DataPoint, question: NumericQuestion, now: datetime | None = None
+) -> NumericDistribution | None:
+    """Builds a numeric distribution purely from a tracked data series'
+    last value and empirical volatility (metaculus_bot.data_index), with no
+    LLM call involved: a random-walk model scaled to the time left until
+    resolution via sqrt(time) -- log-normal (volatility = stdev of log
+    returns) for a price-like series, since prices can't go negative and
+    multiplicative moves are the standard model; additive/normal
+    (volatility = stdev of raw differences) otherwise, since an index like
+    ONI's anomaly can go negative.
+
+    Returns None if `data_point` doesn't carry the numeric fields needed
+    (older/display-only DataPoints, or a series whose fetch() couldn't
+    compute a volatility) -- the caller falls back to LLM-only, same as a
+    fetch failure already does one layer up in data_index.fetch_direct_data."""
+    if data_point.numeric_value is None or data_point.volatility is None or not data_point.period_days:
+        return None
+
+    now = now or datetime.now(timezone.utc)
+    resolution_time = question.scheduled_resolution_time or question.close_time
+    horizon_days = (resolution_time - now).total_seconds() / 86400.0 if resolution_time else 1.0
+    horizon_days = max(horizon_days, 1.0)  # at least one day out, never shrink/zero the spread
+    periods_ahead = horizon_days / data_point.period_days
+    sigma_h = data_point.volatility * math.sqrt(periods_ahead)
+
+    percentiles: list[Percentile] = []
+    for height in _BLEND_HEIGHTS:
+        z = norm.ppf(height)
+        if data_point.is_price:
+            value = data_point.numeric_value * math.exp(z * sigma_h)
+        else:
+            value = data_point.numeric_value + z * sigma_h
+        value = min(max(value, question.lower_bound), question.upper_bound)
+        percentiles.append(Percentile(percentile=height, value=value))
+
+    deduped_values = _dedupe_strictly_increasing([p.value for p in percentiles])
+    percentiles = [Percentile(percentile=p.percentile, value=v) for p, v in zip(percentiles, deduped_values)]
+    try:
+        return build_pchip_numeric_distribution(percentiles, question)
+    except Exception as e:
+        # An extreme enough volatility/horizon combination can push several
+        # adjacent percentile heights to the same clipped bound value (e.g.
+        # both P10 and P20 clip to the lower bound), which _dedupe's tiny
+        # epsilon nudge isn't enough to satisfy Metaculus's own "not too
+        # concentrated" validation on the rebuilt CDF. No real series this
+        # module tracks is anywhere near volatile enough to actually hit
+        # this, but falling back to LLM-only on it is far better than
+        # crashing a question that would otherwise forecast fine.
+        logger.warning(f"Statistical numeric distribution build failed, falling back to LLM-only: {e}")
+        return None
+
+
+def blend_numeric_distributions(
+    stats_distribution: NumericDistribution,
+    llm_distribution: NumericDistribution,
+    question: NumericQuestion,
+    stats_weight: float = 0.7,
+) -> NumericDistribution:
+    """Blends a statistical (data-series) distribution with the LLM
+    ensemble's own distribution by taking a weighted average of each
+    representative percentile's VALUE (same technique
+    research_quality.widen_numeric_distribution already uses to manipulate
+    a distribution: pull a few representative percentiles, transform,
+    rebuild via PCHIP) -- 70% stats / 30% LLM by default, on the premise
+    that a tracked series' last value plus its own historical volatility is
+    a stronger anchor than an LLM's elicited percentiles, but the LLM
+    component still lets qualitative research (an announced policy change,
+    a known seasonal effect) pull the forecast away from a pure random walk."""
+    stats_reps = stats_distribution.get_percentiles_at_target_heights(list(_BLEND_HEIGHTS))
+    llm_reps = llm_distribution.get_percentiles_at_target_heights(list(_BLEND_HEIGHTS))
+
+    blended_values = [
+        stats_weight * s.value + (1 - stats_weight) * l.value for s, l in zip(stats_reps, llm_reps)
+    ]
+    deduped_values = _dedupe_strictly_increasing(blended_values)
+    blended_percentiles = [
+        Percentile(percentile=s.percentile, value=v) for s, v in zip(stats_reps, deduped_values)
+    ]
+    return build_pchip_numeric_distribution(blended_percentiles, question)

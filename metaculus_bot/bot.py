@@ -52,11 +52,13 @@ from forecasting_tools import (
 from forecasting_tools.data_models.data_organizer import DataOrganizer
 from forecasting_tools.data_models.numeric_report import NumericReport
 
-from metaculus_bot import db, research
+from metaculus_bot import data_index, db, research
 from metaculus_bot.aggregation import (
     aggregate_binary_log_odds,
     aggregate_multiple_choice_median,
+    blend_numeric_distributions,
     build_pchip_numeric_distribution,
+    build_statistical_numeric_distribution,
     floor_and_renormalize_mc,
 )
 from metaculus_bot.budget import BudgetGuard, estimate_question_cost
@@ -772,6 +774,23 @@ class FutureEvalBot(ForecastBot):
         if self.debug_log.get(key, {}).get("research_quality") == "weak":
             aggregate = widen_numeric_distribution(aggregate, question)
             self.debug_log[key]["guard_fired"] = True
+
+        # If this question tracks a known published series (data_index's
+        # small registry -- currently ONI/El Nino and US gas prices), blend
+        # a statistical (last value + empirical volatility) distribution in
+        # alongside the LLM ensemble's own, rather than leaning on the LLM
+        # alone to re-derive a number a free public source already has.
+        # Falls back to the LLM-only aggregate above if no series matches,
+        # the series' fetch failed, or it couldn't compute a volatility.
+        data_point = data_index.fetch_direct_data(question.question_text, question.resolution_criteria)
+        stats_distribution = (
+            build_statistical_numeric_distribution(data_point, question) if data_point else None
+        )
+        if stats_distribution is not None:
+            aggregate = blend_numeric_distributions(stats_distribution, aggregate, question)
+            self.debug_log[key]["numeric_method"] = "blended_70stats_30llm"
+        else:
+            self.debug_log[key]["numeric_method"] = "llm_only"
 
         self._check_distribution_or_raise(question, aggregate)
         self._record_debug(
