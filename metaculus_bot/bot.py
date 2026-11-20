@@ -57,6 +57,7 @@ from metaculus_bot.aggregation import (
     aggregate_binary_log_odds,
     aggregate_multiple_choice_median,
     build_pchip_numeric_distribution,
+    floor_and_renormalize_mc,
 )
 from metaculus_bot.budget import BudgetGuard, estimate_question_cost
 from metaculus_bot.calibration import calibrate_binary_probability
@@ -71,7 +72,9 @@ from metaculus_bot.llm_retry import invoke_with_backoff
 from metaculus_bot import provider_quota
 from metaculus_bot.research_quality import (
     assess_research_quality,
+    binary_clip_bounds,
     flatten_mc_toward_uniform,
+    has_no_direct_evidence,
     shrink_binary_toward_half,
     widen_numeric_distribution,
 )
@@ -430,17 +433,19 @@ class FutureEvalBot(ForecastBot):
             )
 
         aggregate = aggregate_binary_log_odds([r.value for r in successes])
-        calibrated = calibrate_binary_probability(
-            aggregate,
-            self.cfg.calibration_k,
-            self.cfg.calibration_clip_min,
-            self.cfg.calibration_clip_max,
-        )
 
         key = _question_key(question)
-        if self.debug_log.get(key, {}).get("research_quality") == "weak":
+        quality = self.debug_log.get(key, {}).get("research_quality")
+        no_evidence = has_no_direct_evidence(research)
+        clip_min, clip_max = binary_clip_bounds(
+            quality, no_evidence, self.cfg.calibration_clip_min, self.cfg.calibration_clip_max
+        )
+        calibrated = calibrate_binary_probability(aggregate, self.cfg.calibration_k, clip_min, clip_max)
+
+        if quality == "weak":
             calibrated = shrink_binary_toward_half(calibrated)
             self.debug_log[key]["guard_fired"] = True
+        self.debug_log[key]["no_direct_evidence"] = no_evidence
 
         self._record_debug(question, results, aggregate, calibrated)
         combined_reasoning = self._combine_reasoning(results)
@@ -550,6 +555,7 @@ class FutureEvalBot(ForecastBot):
         if self.debug_log.get(key, {}).get("research_quality") == "weak":
             aggregate = flatten_mc_toward_uniform(aggregate)
             self.debug_log[key]["guard_fired"] = True
+        aggregate = floor_and_renormalize_mc(aggregate)
 
         self._record_debug(question, results, aggregate.to_dict(), aggregate.to_dict())
         combined_reasoning = self._combine_reasoning(results)

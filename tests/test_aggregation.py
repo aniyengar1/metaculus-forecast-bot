@@ -30,11 +30,11 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-from forecasting_tools import DateQuestion, NumericDistribution, NumericQuestion, Percentile
+from forecasting_tools import DateQuestion, NumericDistribution, NumericQuestion, Percentile, PredictedOption, PredictedOptionList
 from forecasting_tools.data_models.numeric_report import NumericReport
 from scipy.interpolate import PchipInterpolator
 
-from metaculus_bot.aggregation import build_pchip_numeric_distribution
+from metaculus_bot.aggregation import build_pchip_numeric_distribution, floor_and_renormalize_mc
 
 
 def _ts(date_str: str) -> float:
@@ -169,3 +169,45 @@ def test_declared_percentiles_are_monotonically_increasing():
     assert all(b >= a for a, b in zip(percentiles, percentiles[1:]))
     values = [p.value for p in dist.declared_percentiles]
     assert all(b >= a for a, b in zip(values, values[1:]))
+
+
+class TestFloorAndRenormalizeMc:
+    def test_floors_near_zero_option_and_still_sums_to_one(self):
+        options = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="A", probability=0.97),
+                PredictedOption(option_name="B", probability=0.02),
+                PredictedOption(option_name="C", probability=0.01),
+            ]
+        )
+        floored = floor_and_renormalize_mc(options)
+        probs = {o.option_name: o.probability for o in floored.predicted_options}
+        assert abs(sum(probs.values()) - 1.0) < 1e-9
+        assert probs["C"] >= 0.02 - 1e-9
+        assert probs["A"] < 0.97  # renormalization pulls the big option down a little
+
+    def test_no_op_when_already_above_floor(self):
+        options = PredictedOptionList(
+            predicted_options=[
+                PredictedOption(option_name="A", probability=0.6),
+                PredictedOption(option_name="B", probability=0.4),
+            ]
+        )
+        floored = floor_and_renormalize_mc(options)
+        probs = {o.option_name: o.probability for o in floored.predicted_options}
+        assert abs(probs["A"] - 0.6) < 1e-9
+        assert abs(probs["B"] - 0.4) < 1e-9
+
+    def test_many_options_each_floored_still_sums_to_one(self):
+        # 10 options, one dominant -- every other option under the 2% floor
+        # before flooring (a realistic MC shape, e.g. "who will win" with a
+        # heavy favorite and many long-shot others).
+        options = PredictedOptionList(
+            predicted_options=[PredictedOption(option_name="FAVORITE", probability=0.91)]
+            + [PredictedOption(option_name=f"LONGSHOT_{i}", probability=0.01) for i in range(9)]
+        )
+        floored = floor_and_renormalize_mc(options)
+        probs = {o.option_name: o.probability for o in floored.predicted_options}
+        assert abs(sum(probs.values()) - 1.0) < 1e-9
+        for i in range(9):
+            assert probs[f"LONGSHOT_{i}"] >= 0.02 - 1e-9

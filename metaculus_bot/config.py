@@ -190,10 +190,15 @@ class Config:
     market_pulse_reforecast_staleness_days: int = 3
     market_pulse_max_reforecasts_per_day: int = 5
 
-    # Calibration (applied to final binary probability only)
+    # Calibration (applied to final binary probability only). Tightened
+    # 2026-11-20 from [0.02, 0.98] after the performance review showed
+    # several confidently-wrong binary losses; a separate, still-tighter
+    # [0.15, 0.85] clip applies automatically when research_quality is weak
+    # or the research found no direct evidence on the question -- see
+    # metaculus_bot.research_quality.binary_clip_bounds.
     calibration_k: float = 1.0
-    calibration_clip_min: float = 0.02
-    calibration_clip_max: float = 0.98
+    calibration_clip_min: float = 0.05
+    calibration_clip_max: float = 0.95
 
     # Storage
     db_path: str = "data/forecasts.db"
@@ -237,8 +242,8 @@ def load_config() -> Config:
         market_pulse_reforecast_staleness_days=_get_int("MARKET_PULSE_REFORECAST_STALENESS_DAYS", 3),
         market_pulse_max_reforecasts_per_day=_get_int("MARKET_PULSE_MAX_REFORECASTS_PER_DAY", 5),
         calibration_k=_get_float("CALIBRATION_K", 1.0),
-        calibration_clip_min=_get_float("CALIBRATION_CLIP_MIN", 0.02),
-        calibration_clip_max=_get_float("CALIBRATION_CLIP_MAX", 0.98),
+        calibration_clip_min=_get_float("CALIBRATION_CLIP_MIN", 0.05),
+        calibration_clip_max=_get_float("CALIBRATION_CLIP_MAX", 0.95),
         db_path=os.getenv("BOT_DB_PATH", "data/forecasts.db"),
     )
 

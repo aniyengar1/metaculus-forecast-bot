@@ -74,6 +74,58 @@ def assess_research_quality(research_summary: str) -> tuple[str, str]:
     return "ok", "research has substantive, dated content"
 
 
+# Phrases the research-summarizer itself uses when it found plenty of
+# *surrounding* context (so assess_research_quality's length/date checks
+# pass -- "ok") but explicitly says it found nothing on the actual question.
+# See the 2026-11-13 AST driving-test-calendar loss (-42.2 peer): research
+# was long, dated, and substantive, and still said in so many words that it
+# found no evidence either way -- the bot forecast 62% yes anyway. This is a
+# distinct failure mode from "weak" (thin research) and from the research-
+# quality guard above (those catch the research itself being bad; this
+# catches good research that is simply inconclusive on this question).
+_NO_EVIDENCE_PHRASES = (
+    "no information regarding",
+    "no information about",
+    "no relevant factual information",
+    "could not find",
+    "couldn't find",
+    "no results found",
+    "unable to determine",
+    "no data available",
+    "contains no information",
+    "no evidence of",
+    "no evidence that",
+    "no indication that",
+    "no indication of",
+    "did not find any",
+    "found no information",
+    "no further information",
+)
+
+
+def has_no_direct_evidence(research_summary: str) -> bool:
+    """True if the research text itself says, in substance, that it found
+    nothing bearing on the actual question -- regardless of how long,
+    dated, or otherwise substantive the surrounding text is."""
+    body = _SOURCE_TAG_PATTERN.sub("", research_summary or "").strip().lower()
+    return any(phrase in body for phrase in _NO_EVIDENCE_PHRASES)
+
+
+def binary_clip_bounds(
+    quality: str,
+    no_direct_evidence: bool,
+    default_clip_min: float,
+    default_clip_max: float,
+) -> tuple[float, float]:
+    """Picks the calibration clip bounds for a binary forecast: the tight
+    [0.15, 0.85] guard bounds when research_quality is weak OR the research
+    found no direct evidence on this specific question, else the caller's
+    own (wider) default bounds."""
+    if quality == "weak" or no_direct_evidence:
+        return GUARD_BINARY_CLIP_MIN, GUARD_BINARY_CLIP_MAX
+    return default_clip_min, default_clip_max
+
+
 def shrink_binary_toward_half(p: float) -> float:
     """Pulls a binary probability 50% of the way (in log-odds) back toward
     0.5, then clips to [0.15, 0.85] -- reuses the existing calibration hook

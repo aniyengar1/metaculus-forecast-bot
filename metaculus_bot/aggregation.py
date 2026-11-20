@@ -72,6 +72,65 @@ def aggregate_multiple_choice_median(
     )
 
 
+_MC_OPTION_FLOOR = 0.02
+
+
+def floor_and_renormalize_mc(
+    option_list: PredictedOptionList, floor: float = _MC_OPTION_FLOOR
+) -> PredictedOptionList:
+    """Floors every option's probability at `floor` (2% by default) and
+    renormalizes so the list still sums to 1 -- a multiple-choice ensemble
+    that's confidently near 0% on an option is making the same kind of
+    overconfident bet the binary calibration clip (see
+    metaculus_bot.calibration/research_quality) now guards against, just
+    with more than two outcomes.
+
+    A single floor-then-divide-by-new-total pass isn't enough: dividing by
+    a total inflated by the floored entries can push a *different* entry
+    back under the floor (e.g. [0.97, 0.02, 0.01] with floor 0.02 floors
+    index 2 to 0.02, but the new total 1.01 then rescales index 1 down to
+    0.0198 -- under the floor again). Water-fill instead: lock any entry
+    under the floor at exactly `floor`, rescale only the remaining ("free")
+    entries to absorb 1 minus the locked mass, and repeat until a pass locks
+    nothing new -- at most len(options) passes."""
+    options = option_list.predicted_options
+    original = [o.probability for o in options]
+    n = len(original)
+    locked = [False] * n
+    result = list(original)
+
+    for _ in range(n):
+        free_indices = [i for i in range(n) if not locked[i]]
+        if not free_indices:
+            break
+        remaining = 1.0 - sum(floor for i in range(n) if locked[i])
+        free_total = sum(original[i] for i in free_indices)
+        if free_total <= 0:
+            share = remaining / len(free_indices)
+            for i in free_indices:
+                result[i] = share
+            break
+        scale = remaining / free_total
+        newly_locked = False
+        for i in free_indices:
+            scaled = original[i] * scale
+            if scaled < floor:
+                result[i] = floor
+                locked[i] = True
+                newly_locked = True
+            else:
+                result[i] = scaled
+        if not newly_locked:
+            break
+
+    return PredictedOptionList(
+        predicted_options=[
+            PredictedOption(option_name=o.option_name, probability=p)
+            for o, p in zip(options, result)
+        ]
+    )
+
+
 def _dedupe_strictly_increasing(xs: list[float]) -> list[float]:
     out = list(xs)
     for i in range(1, len(out)):

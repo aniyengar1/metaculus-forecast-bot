@@ -13,7 +13,9 @@ from forecasting_tools import DateQuestion, NumericDistribution, NumericQuestion
 
 from metaculus_bot.research_quality import (
     assess_research_quality,
+    binary_clip_bounds,
     flatten_mc_toward_uniform,
+    has_no_direct_evidence,
     shrink_binary_toward_half,
     widen_numeric_distribution,
 )
@@ -92,6 +94,49 @@ class TestAssessResearchQuality:
         quality, reason = assess_research_quality(f"[research source: asknews]\n{body}")
         assert quality == "ok"
         assert "substantive" in reason
+
+
+class TestHasNoDirectEvidence:
+    def test_flags_ast_style_inconclusive_research(self):
+        # Real research text from the 2026-11-13 AST driving-test-calendar
+        # loss (-42.2 peer): long, dated, substantive -- "ok" quality -- but
+        # explicitly says it found nothing on the actual question.
+        text = (
+            "[research source: duckduckgo_fallback]\n"
+            "AST S.p.A. initiated a selection process for hiring 73 operatori "
+            "di esercizio, announced in September 2026. The provided search "
+            "results confirm the existence of the selection process "
+            "announcement, but contain no information regarding the "
+            "subsequent publication of a practical-driving-test calendar or "
+            "candidate convocations."
+        )
+        quality, _ = assess_research_quality(text)
+        assert quality == "ok"  # long/dated enough to pass the weak check
+        assert has_no_direct_evidence(text) is True
+
+    def test_substantive_conclusive_research_has_evidence(self):
+        body = (
+            "EIA reported the US national average gas price at $4.153/gal "
+            "for the week of 2026-11-02, up from $4.084/gal a month earlier."
+        )
+        assert has_no_direct_evidence(f"[research source: asknews]\n{body}") is False
+
+    def test_empty_text_does_not_crash_and_has_no_phrase_match(self):
+        # Empty research is already caught by assess_research_quality's
+        # "weak" path (binary_clip_bounds ORs the two together) -- this
+        # function only needs to not blow up on it.
+        assert has_no_direct_evidence("") is False
+
+
+class TestBinaryClipBounds:
+    def test_weak_quality_uses_tight_bounds(self):
+        assert binary_clip_bounds("weak", False, 0.05, 0.95) == (0.15, 0.85)
+
+    def test_no_direct_evidence_uses_tight_bounds_even_if_ok(self):
+        assert binary_clip_bounds("ok", True, 0.05, 0.95) == (0.15, 0.85)
+
+    def test_ok_quality_with_evidence_uses_default_bounds(self):
+        assert binary_clip_bounds("ok", False, 0.05, 0.95) == (0.05, 0.95)
 
 
 class TestShrinkBinaryTowardHalf:
